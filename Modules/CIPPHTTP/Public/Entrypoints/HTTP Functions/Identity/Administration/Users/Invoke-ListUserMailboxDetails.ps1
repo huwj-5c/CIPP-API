@@ -4,6 +4,8 @@ function Invoke-ListUserMailboxDetails {
         Entrypoint
     .ROLE
         Exchange.Mailbox.Read
+    .DESCRIPTION
+        Retrieves detailed Exchange Online mailbox properties for a specific user, including quotas, archive status, and protocols.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -83,11 +85,16 @@ function Invoke-ListUserMailboxDetails {
                 $ArchiveEnabled = $false
             }
 
-            # Get organization config of auto-expanding archive if it's disabled on user level
-            if (-not $MailboxDetailedRequest.AutoExpandingArchiveEnabled -and $ArchiveEnabled) {
-                $AutoExpandingArchiveEnabled = $OrgConfig.AutoExpandingArchiveEnabled
+            # Check org-level first; if enabled org-wide, report that. Otherwise use mailbox-specific value.
+            if ($OrgConfig.AutoExpandingArchiveEnabled) {
+                $AutoExpandingArchiveEnabled = $true
+                $AutoExpandingArchiveScope = 'Organization'
+            } elseif ($MailboxDetailedRequest.AutoExpandingArchiveEnabled) {
+                $AutoExpandingArchiveEnabled = $true
+                $AutoExpandingArchiveScope = 'Mailbox'
             } else {
-                $AutoExpandingArchiveEnabled = $MailboxDetailedRequest.AutoExpandingArchiveEnabled
+                $AutoExpandingArchiveEnabled = $false
+                $AutoExpandingArchiveScope = 'None'
             }
         } catch {
             $ArchiveEnabled = $false
@@ -234,36 +241,38 @@ function Invoke-ListUserMailboxDetails {
 
     # Build the GraphRequest object
     $GraphRequest = [ordered]@{
-        ForwardAndDeliver        = $MailboxDetailedRequest.DeliverToMailboxAndForward
-        ForwardingAddress        = $ForwardingAddress
-        LitigationHold           = $MailboxDetailedRequest.LitigationHoldEnabled
-        RetentionHold            = $MailboxDetailedRequest.RetentionHoldEnabled
-        ComplianceTagHold        = $MailboxDetailedRequest.ComplianceTagHoldApplied
-        InPlaceHold              = $InPlaceHold
-        EDiscoveryHold           = $EDiscoveryHold
-        PurviewRetentionHold     = $PurviewRetentionHold
-        ExcludedFromOrgWideHold  = $ExcludedFromOrgWideHold
-        HiddenFromAddressLists   = $MailboxDetailedRequest.HiddenFromAddressListsEnabled
-        EWSEnabled               = $CASRequest.EwsEnabled
-        MailboxMAPIEnabled       = $CASRequest.MAPIEnabled
-        MailboxOWAEnabled        = $CASRequest.OWAEnabled
-        MailboxImapEnabled       = $CASRequest.ImapEnabled
-        MailboxPopEnabled        = $CASRequest.PopEnabled
-        MailboxActiveSyncEnabled = $CASRequest.ActiveSyncEnabled
-        Permissions              = @($ParsedPerms)
-        ProhibitSendQuota        = $ProhibitSendQuota
-        ProhibitSendReceiveQuota = $ProhibitSendReceiveQuota
-        ItemCount                = [math]::Round($StatsRequest.ItemCount, 2)
-        TotalItemSize            = $TotalItemSize
-        TotalArchiveItemSize     = $TotalArchiveItemSize
-        TotalArchiveItemCount    = $TotalArchiveItemCount
-        BlockedForSpam           = $BlockedForSpam
-        ArchiveMailBox           = $ArchiveEnabled
-        AutoExpandingArchive     = $AutoExpandingArchiveEnabled
-        RecipientTypeDetails     = $MailboxDetailedRequest.RecipientTypeDetails
-        Mailbox                  = $MailboxDetailedRequest
-        RetentionPolicy          = $MailboxDetailedRequest.RetentionPolicy
-        MailboxActionsData       = ($MailboxDetailedRequest | Select-Object id, ExchangeGuid, ArchiveGuid, WhenSoftDeleted,
+        ForwardAndDeliver                = $MailboxDetailedRequest.DeliverToMailboxAndForward
+        ForwardingAddress                = $ForwardingAddress
+        LitigationHold                   = $MailboxDetailedRequest.LitigationHoldEnabled
+        RetentionHold                    = $MailboxDetailedRequest.RetentionHoldEnabled
+        ComplianceTagHold                = $MailboxDetailedRequest.ComplianceTagHoldApplied
+        InPlaceHold                      = $InPlaceHold
+        EDiscoveryHold                   = $EDiscoveryHold
+        PurviewRetentionHold             = $PurviewRetentionHold
+        ExcludedFromOrgWideHold          = $ExcludedFromOrgWideHold
+        HiddenFromAddressLists           = $MailboxDetailedRequest.HiddenFromAddressListsEnabled
+        EWSEnabled                       = $CASRequest.EwsEnabled
+        MailboxMAPIEnabled               = $CASRequest.MAPIEnabled
+        MailboxOWAEnabled                = $CASRequest.OWAEnabled
+        MailboxImapEnabled               = $CASRequest.ImapEnabled
+        MailboxPopEnabled                = $CASRequest.PopEnabled
+        MailboxActiveSyncEnabled         = $CASRequest.ActiveSyncEnabled
+        SmtpClientAuthenticationDisabled = $CASRequest.SmtpClientAuthenticationDisabled
+        Permissions                      = @($ParsedPerms)
+        ProhibitSendQuota                = $ProhibitSendQuota
+        ProhibitSendReceiveQuota         = $ProhibitSendReceiveQuota
+        ItemCount                        = [math]::Round($StatsRequest.ItemCount, 2)
+        TotalItemSize                    = $TotalItemSize
+        TotalArchiveItemSize             = $TotalArchiveItemSize
+        TotalArchiveItemCount            = $TotalArchiveItemCount
+        BlockedForSpam                   = $BlockedForSpam
+        ArchiveMailBox                   = $ArchiveEnabled
+        AutoExpandingArchive             = $AutoExpandingArchiveEnabled
+        AutoExpandingArchiveScope        = $AutoExpandingArchiveScope
+        RecipientTypeDetails             = $MailboxDetailedRequest.RecipientTypeDetails
+        Mailbox                          = $MailboxDetailedRequest
+        RetentionPolicy                  = $MailboxDetailedRequest.RetentionPolicy
+        MailboxActionsData               = ($MailboxDetailedRequest | Select-Object id, ExchangeGuid, ArchiveGuid, WhenSoftDeleted,
             @{ Name = 'UPN'; Expression = { $_.'UserPrincipalName' } },
             @{ Name = 'displayName'; Expression = { $_.'DisplayName' } },
             @{ Name = 'primarySmtpAddress'; Expression = { $_.'PrimarySMTPAddress' } },

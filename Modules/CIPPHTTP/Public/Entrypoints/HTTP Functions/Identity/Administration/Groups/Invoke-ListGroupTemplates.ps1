@@ -47,6 +47,9 @@ function Invoke-ListGroupTemplates {
                 membershipRules = $data.membershipRules
                 allowExternal   = $data.allowExternal
                 username        = $data.username
+                licenses        = $data.licenses
+                aliases         = $data.aliases
+                hideFromGAL     = $data.hideFromGAL
                 GUID            = $_.RowKey
                 source          = $_.Source
                 isSynced        = (![string]::IsNullOrEmpty($_.SHA))

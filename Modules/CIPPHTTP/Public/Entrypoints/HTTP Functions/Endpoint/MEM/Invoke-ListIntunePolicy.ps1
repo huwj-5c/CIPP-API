@@ -1,10 +1,11 @@
-
 function Invoke-ListIntunePolicy {
     <#
     .FUNCTIONALITY
         Entrypoint
     .ROLE
         Endpoint.MEM.Read
+    .DESCRIPTION
+        Lists Intune device configuration policies for a tenant. Supports UseReportDB=true query parameter to retrieve cached data from the reporting database for significantly better performance, especially when querying AllTenants.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -78,13 +79,47 @@ function Invoke-ListIntunePolicy {
                     }
 
                     if ($DefinitionRequests.Count -gt 0) {
+                        $HasDefinitionFailures = $false
                         $DefinitionResults = New-GraphBulkRequest -Requests @($DefinitionRequests) -tenantid $TenantFilter
                         foreach ($DefinitionResult in $DefinitionResults) {
+                            if ($DefinitionResult.status -ne 200) {
+                                $HasDefinitionFailures = $true
+                                continue
+                            }
+
                             $SettingId = $SettingIdMap[$DefinitionResult.id]
                             $Setting = $GraphRequest.settings | Where-Object { $_.id -eq $SettingId } | Select-Object -First 1
                             if ($Setting) {
                                 $Definitions = @($DefinitionResult.body.value ?? $DefinitionResult.body)
                                 $Setting | Add-Member -NotePropertyName settingDefinitions -NotePropertyValue $Definitions -Force
+                            }
+                        }
+
+                        if ($HasDefinitionFailures -and $GraphRequest.templateReference.templateId) {
+                            try {
+                                $TemplateSettingsResponse = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/deviceManagement/configurationPolicyTemplates('$($GraphRequest.templateReference.templateId)')/settingTemplates?`$expand=settingDefinitions&`$top=1000" -tenantid $TenantFilter
+                                $TemplateSettings = @($TemplateSettingsResponse.value ?? $TemplateSettingsResponse)
+                                $TemplateDefinitionsByInstanceId = @{}
+
+                                foreach ($TemplateSetting in $TemplateSettings) {
+                                    $TemplateInstanceId = $TemplateSetting.settingInstanceTemplate.settingInstanceTemplateId
+                                    $TemplateDefinitions = @($TemplateSetting.settingDefinitions | Where-Object { $_.id })
+                                    if ($TemplateInstanceId -and $TemplateDefinitions.Count -gt 0) {
+                                        $TemplateDefinitionsByInstanceId[$TemplateInstanceId] = $TemplateDefinitions
+                                    }
+                                }
+
+                                foreach ($Setting in $GraphRequest.settings) {
+                                    $ExistingDefinitions = @($Setting.settingDefinitions | Where-Object { $_.id })
+                                    if ($ExistingDefinitions.Count -gt 0) { continue }
+
+                                    $TemplateInstanceId = $Setting.settingInstance.settingInstanceTemplateReference.settingInstanceTemplateId
+                                    if ($TemplateInstanceId -and $TemplateDefinitionsByInstanceId.ContainsKey($TemplateInstanceId)) {
+                                        $Setting | Add-Member -NotePropertyName settingDefinitions -NotePropertyValue $TemplateDefinitionsByInstanceId[$TemplateInstanceId] -Force
+                                    }
+                                }
+                            } catch {
+                                Write-Information "Could not retrieve configuration policy template definitions for ${ID}: $($_.Exception.Message)"
                             }
                         }
                     }
@@ -180,6 +215,16 @@ function Invoke-ListIntunePolicy {
                     method = 'GET'
                     url    = "/deviceManagement/configurationPolicies?`$expand=assignments&`$top=1000"
                 }
+                @{
+                    id     = 'deviceCompliancePolicies'
+                    method = 'GET'
+                    url    = "/deviceManagement/deviceCompliancePolicies?`$expand=assignments&`$top=1000"
+                }
+                @{
+                    id     = 'Intents'
+                    method = 'GET'
+                    url    = "/deviceManagement/intents?`$top=1000"
+                }
             )
 
             $BulkResults = New-GraphBulkRequest -Requests $BulkRequests -tenantid $TenantFilter
@@ -190,7 +235,8 @@ function Invoke-ListIntunePolicy {
             $GraphRequest = $BulkResults | Where-Object { $_.id -ne 'Groups' } | ForEach-Object {
                 $URLName = $_.Id
                 $_.body.Value | ForEach-Object {
-                    $policyTypeName = switch -Wildcard ($_.'assignments@odata.context') {
+                    $AssignmentContext = $_.'assignments@odata.context'
+                    $policyTypeName = switch -Wildcard ($AssignmentContext) {
                         '*microsoft.graph.windowsIdentityProtectionConfiguration*' { 'Identity Protection' }
                         '*microsoft.graph.windows10EndpointProtectionConfiguration*' { 'Endpoint Protection' }
                         '*microsoft.graph.windows10CustomConfiguration*' { 'Custom' }
@@ -208,7 +254,18 @@ function Invoke-ListIntunePolicy {
                         '*iosUpdateConfiguration*' { 'iOS Update Configuration' }
                         '*windowsDriverUpdateProfiles*' { 'Driver Update' }
                         '*configurationPolicies*' { 'Device Configuration' }
-                        default { $_.'assignments@odata.context' }
+                        '*deviceCompliancePolicies*' { 'Compliance Policy' }
+                        '*intents*' { 'Endpoint Security' }
+                        default { $null }
+                    }
+                    # Fall back to the request type when the assignment context does not identify the policy
+                    # (e.g. Intents are listed without expanding assignments).
+                    if ([string]::IsNullOrWhiteSpace($policyTypeName)) {
+                        $policyTypeName = switch ($URLName) {
+                            'deviceCompliancePolicies' { 'Compliance Policy' }
+                            'Intents' { 'Endpoint Security' }
+                            default { $AssignmentContext }
+                        }
                     }
                     $Assignments = $_.assignments.target | Select-Object -Property '@odata.type', groupId
                     $PolicyAssignment = [System.Collections.Generic.List[string]]::new()

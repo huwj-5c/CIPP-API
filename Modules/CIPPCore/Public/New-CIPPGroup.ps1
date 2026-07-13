@@ -192,6 +192,19 @@ function New-CIPPGroup {
             } catch {
                 Write-Warning "Failed to write group creation cache for $($GroupObject.displayName): $($_.Exception.Message)"
             }
+
+            # Assign licenses for Security groups
+            if ($NormalizedGroupType -eq 'Generic' -and $GroupObject.licenses) {
+                $LicenseSkuIds = @($GroupObject.licenses | Where-Object { $_ } | ForEach-Object { $_.value ?? $_ })
+                if ($LicenseSkuIds.Count -gt 0) {
+                    try {
+                        $null = Set-CIPPGroupLicense -GroupId $GraphRequest.id -GroupName $GroupObject.displayName -AddLicenses $LicenseSkuIds -TenantFilter $TenantFilter -APIName $APIName
+                    } catch {
+                        Write-Warning "Failed to assign licenses to group $($GroupObject.displayName): $($_.Exception.Message)"
+                    }
+                }
+            }
+
             if ($GroupObject.subscribeMembers) {
                 #Waiting for group to become available in Exo.
                 Start-Sleep -Seconds 10
@@ -262,6 +275,18 @@ function New-CIPPGroup {
                 }
 
                 $GraphRequest = New-ExoRequest -tenantid $TenantFilter -cmdlet 'New-DistributionGroup' -cmdParams $ExoParams
+
+                $Aliases = @($GroupObject.aliases -split '\r?\n' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+                $SetParams = @{ Identity = $GraphRequest.Identity }
+                if ($GroupObject.hideFromGAL) {
+                    $SetParams.HiddenFromAddressListsEnabled = $true
+                }
+                if ($Aliases.Count -gt 0) {
+                    $SetParams.EmailAddresses = @{ '@odata.type' = '#Exchange.GenericHashTable'; Add = @($Aliases | ForEach-Object { "smtp:$_" }) }
+                }
+                if ($SetParams.Keys.Count -gt 1) {
+                    $null = New-ExoRequest -tenantid $TenantFilter -cmdlet 'Set-DistributionGroup' -cmdParams $SetParams
+                }
             }
 
             $Result = [PSCustomObject]@{

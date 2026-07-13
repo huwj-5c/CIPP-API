@@ -4,6 +4,8 @@ function Invoke-ListmailboxPermissions {
         Entrypoint
     .ROLE
         Exchange.Mailbox.Read
+    .DESCRIPTION
+        Lists mailbox permissions (Full Access, Send As, Send on Behalf) for a tenant. Supports UseReportDB=true query parameter to retrieve cached data from the reporting database for significantly better performance, especially when querying AllTenants.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -12,6 +14,7 @@ function Invoke-ListmailboxPermissions {
     $UserID = $Request.Query.userId
     $UseReportDB = $Request.Query.UseReportDB
     $ByUser = $Request.Query.ByUser
+    $User = $Request.Query.User
 
     try {
         # If UseReportDB is specified and no specific UserID, retrieve from report database
@@ -26,6 +29,11 @@ function Invoke-ListmailboxPermissions {
             }
             try {
                 $GraphRequest = Get-CIPPMailboxPermissionReport @ReportParams
+                if ($User -and $ByUser -eq 'true') {
+                    # Only the user-grouped report has a top-level User property; in the
+                    # mailbox-grouped shape this filter would empty the whole result set.
+                    $GraphRequest = @($GraphRequest | Where-Object { $_.User -eq $User })
+                }
                 $StatusCode = [HttpStatusCode]::OK
             } catch {
                 $StatusCode = [HttpStatusCode]::InternalServerError

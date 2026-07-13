@@ -15,7 +15,12 @@ function Start-CIPPDBTestsRun {
         [string]$TenantFilter = 'allTenants',
 
         [Parameter(Mandatory = $false)]
-        [switch]$Force
+        [switch]$Force,
+
+        # Optional subset of suites to run (e.g. 'Custom'). Omit to run every suite.
+        # Suite names must match the ValidateSet in Invoke-CIPPTestCollection.
+        [Parameter(Mandatory = $false)]
+        [string[]]$Suites
     )
 
     Write-Information "Starting tests run for tenant: $TenantFilter"
@@ -38,6 +43,8 @@ function Start-CIPPDBTestsRun {
     }
 
     try {
+        try { [CIPP.TestDataCache]::Clear() } catch { Write-Information "TestDataCache clear skipped: $($_.Exception.Message)" }
+
         $AllTenantsList = if ($TenantFilter -eq 'allTenants') {
             $DbCounts = Get-CIPPDbItem -CountsOnly -TenantFilter 'allTenants'
             $TenantsWithData = $DbCounts | Where-Object { (($_.DataCount ?? $_.Count) ?? 0) -gt 0 } | Select-Object -ExpandProperty PartitionKey -Unique
@@ -58,23 +65,35 @@ function Start-CIPPDBTestsRun {
             return
         }
 
-        # Phase 1: Build per-tenant list activities (discover tests per tenant)
+        # Phase 1: Build per-tenant list activities (discover tests per tenant).
+        # The tenants below were already filtered by data presence above, so we pass
+        # SkipDbCheck=$true to avoid a redundant CountsOnly round-trip per tenant.
         $Batch = foreach ($Tenant in $AllTenantsList) {
-            @{
+            $ListItem = @{
                 FunctionName = 'CIPPTestsList'
                 TenantFilter = $Tenant
+                SkipDbCheck  = $true
             }
+            # Propagate an optional suite filter so Phase 1 emits only the requested suites.
+            if ($Suites) {
+                $ListItem.Suites = @($Suites)
+            }
+            $ListItem
         }
 
         Write-Information "Built batch of $($Batch.Count) tenant test list activities"
 
         # Phase 2 via PostExecution: Aggregate all task lists and start flat execution orchestrator
+        $NameSuffix = if ($TenantFilter -ne 'allTenants') { "-$TenantFilter" } else { '' }
         $InputObject = [PSCustomObject]@{
-            OrchestratorName = 'TestsList'
+            OrchestratorName = "TestsList$NameSuffix"
             Batch            = @($Batch)
             SkipLog          = $true
             PostExecution    = @{
                 FunctionName = 'CIPPTestsApplyBatch'
+                Parameters   = @{
+                    TenantFilter = $TenantFilter
+                }
             }
         }
 

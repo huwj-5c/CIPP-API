@@ -25,12 +25,11 @@ function Set-CIPPDBCacheCsTeamsClientConfiguration {
     try {
         Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message 'Caching Teams Client Configuration' -sev Debug
 
-        $ClientConfig = New-TeamsRequest -TenantFilter $TenantFilter -Cmdlet 'Get-CsTeamsClientConfiguration' -CmdParams @{ Identity = 'Global' }
+        $ClientConfig = New-TeamsRequestV2 -TenantFilter $TenantFilter -Type 'TeamsClientConfiguration' -Action Get -Identity 'Global'
 
         if ($ClientConfig) {
             $Data = @($ClientConfig)
-            Add-CIPPDbItem -TenantFilter $TenantFilter -Type 'CsTeamsClientConfiguration' -Data $Data
-            Add-CIPPDbItem -TenantFilter $TenantFilter -Type 'CsTeamsClientConfiguration' -Data $Data -Count
+            Add-CIPPDbItem -TenantFilter $TenantFilter -Type 'CsTeamsClientConfiguration' -Data $Data -AddCount
             Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message 'Cached Teams Client Configuration' -sev Debug
         }
         $ClientConfig = $null

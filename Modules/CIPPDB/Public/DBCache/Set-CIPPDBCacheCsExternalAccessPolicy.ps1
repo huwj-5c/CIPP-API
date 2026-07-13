@@ -24,12 +24,11 @@ function Set-CIPPDBCacheCsExternalAccessPolicy {
     try {
         Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message 'Caching Teams External Access Policy' -sev Debug
 
-        $ExternalAccess = New-TeamsRequest -TenantFilter $TenantFilter -Cmdlet 'Get-CsExternalAccessPolicy' -CmdParams @{ Identity = 'Global' }
+        $ExternalAccess = New-TeamsRequestV2 -TenantFilter $TenantFilter -Type 'ExternalAccessPolicy' -Action Get -Identity 'Global'
 
         if ($ExternalAccess) {
             $Data = @($ExternalAccess)
-            Add-CIPPDbItem -TenantFilter $TenantFilter -Type 'CsExternalAccessPolicy' -Data $Data
-            Add-CIPPDbItem -TenantFilter $TenantFilter -Type 'CsExternalAccessPolicy' -Data $Data -Count
+            Add-CIPPDbItem -TenantFilter $TenantFilter -Type 'CsExternalAccessPolicy' -Data $Data -AddCount
             Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message 'Cached Teams External Access Policy' -sev Debug
         }
         $ExternalAccess = $null

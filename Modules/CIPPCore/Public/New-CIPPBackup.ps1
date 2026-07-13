@@ -70,6 +70,14 @@ function New-CIPPBackup {
                         }
                         $Entities | Select-Object * -ExcludeProperty DomainAnalyser, table, Timestamp, ETag, Results | Select-Object *, @{l = 'table'; e = { $CSVTable } }
                     }
+                    # Back up excluded tenant rows (user-configured exclusion state only)
+                    $TenantsTable = Get-CippTable -tablename 'Tenants'
+                    $ExcludedTenants = Get-AzDataTableEntity @TenantsTable -Filter "PartitionKey eq 'Tenants' and Excluded eq true"
+                    if ($ExcludedTenants) {
+                        $CSVfile = @($CSVfile) + @(
+                            $ExcludedTenants | Select-Object PartitionKey, RowKey, customerId, defaultDomainName, displayName, Excluded, ExcludeDate, ExcludeUser | Select-Object *, @{l = 'table'; e = { 'Tenants' } }
+                        )
+                    }
                     $RowKey = 'CIPPBackup' + '_' + (Get-Date).ToString('yyyy-MM-dd-HHmm')
                     $BackupData = [string]($CSVfile | ConvertTo-Json -Compress -Depth 100)
                     $TableName = 'CIPPBackup'
@@ -153,6 +161,10 @@ function New-CIPPBackup {
                 # If building full URL fails, fall back to resource path
                 $blobUrl = $resourcePath
             }
+
+            # Best-effort off-site replication to an external storage account.
+            $ReplType = if ($backupType -eq 'CIPP') { 'Core' } else { 'Tenant' }
+            Push-CIPPBackupReplication -BackupType $ReplType -BlobName $blobName -Content $BackupData -Headers $Headers
         } catch {
             $ErrorMessage = Get-CippException -Exception $_
             Write-LogMessage -headers $Headers -API $APINAME -message "Blob upload failed: $($ErrorMessage.NormalizedError)" -Sev 'Error' -LogData $ErrorMessage
