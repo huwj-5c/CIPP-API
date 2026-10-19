@@ -26,7 +26,8 @@ function Set-CIPPDBCacheSPOTenant {
     try {
         Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message 'Caching SharePoint Online tenant configuration' -sev Debug
 
-        $SPOTenant = Get-CIPPSPOTenant -TenantFilter $TenantFilter -SkipCache
+        # App-only with the SAM certificate: delegated SharePoint admin 401s on GDAP customer tenants.
+        $SPOTenant = Get-CIPPSPOTenant -TenantFilter $TenantFilter -SkipCache -UseCertificate
 
         # An empty response is a failure too: this collection only runs for SharePoint-licensed
         # tenants, so there is always a configuration object to return. Falling through quietly

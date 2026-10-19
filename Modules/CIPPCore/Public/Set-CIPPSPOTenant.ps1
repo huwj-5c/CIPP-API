@@ -68,10 +68,19 @@ function Set-CIPPSPOTenant {
         [string]$SharepointPrefix,
         [Parameter(ValueFromPipelineByPropertyName = $true, ParameterSetName = 'Properties')]
         [Parameter(ValueFromPipelineByPropertyName = $true, ParameterSetName = 'Method')]
-        [string]$SharepointDomain
+        [string]$SharepointDomain,
+        # SharePoint app-only auth requires a certificate (secret app-only is rejected by SPO). When
+        # set, authenticate app-only with the SAM certificate instead of the delegated context.
+        [Parameter(ParameterSetName = 'Properties')]
+        [Parameter(ParameterSetName = 'Method')]
+        [switch]$UseCertificate
     )
 
     process {
+        # Threaded onto the ProcessQuery call below; empty = unchanged delegated behaviour.
+        $AuthSplat = @{}
+        if ($UseCertificate) { $AuthSplat['AsApp'] = $true; $AuthSplat['UseCertificate'] = $true }
+
         if (!$SharepointPrefix) {
             # get sharepoint admin site
             $SharePointInfo = Get-SharePointAdminLink -Public $false -tenantFilter $TenantFilter
@@ -91,22 +100,34 @@ function Set-CIPPSPOTenant {
             $SetProperty = [System.Collections.Generic.List[string]]::new()
             $x = 114
             foreach ($Property in $Properties.Keys) {
-                # Get property type
-                $PropertyType = $Properties[$Property].GetType().Name
-                if ($PropertyType -in $AllowedTypes) {
-                    if ($PropertyType -eq 'Boolean') {
-                        $PropertyToSet = $Properties[$Property].ToString().ToLower()
-                    } else {
-                        $PropertyToSet = $Properties[$Property]
-                    }
-                    $xml = @"
+                $Value = $Properties[$Property]
+                if ($null -eq $Value) { throw "Property '$Property' has no value" }
+
+                # Values that came through JSON arrive as Int64 (or a whole Double); CSOM only
+                # takes Int32 for numeric tenant properties, so coerce rather than drop them.
+                if ($Value -is [int64] -or $Value -is [int16] -or $Value -is [byte] -or ($Value -is [double] -and $Value -eq [math]::Truncate($Value))) {
+                    $Value = [int]$Value
+                }
+
+                $PropertyType = $Value.GetType().Name
+                if ($PropertyType -notin $AllowedTypes) {
+                    # Silently skipping leaves the caller logging success for a write that never
+                    # happened - surface it instead.
+                    throw "Property '$Property' has unsupported type '$PropertyType'. Supported: $($AllowedTypes -join ', ')"
+                }
+
+                if ($PropertyType -eq 'Boolean') {
+                    $PropertyToSet = $Value.ToString().ToLower()
+                } else {
+                    $PropertyToSet = [System.Security.SecurityElement]::Escape([string]$Value)
+                }
+                $xml = @"
     <SetProperty Id="$x" ObjectPathId="110" Name="$Property">
         <Parameter Type="$PropertyType">$($PropertyToSet)</Parameter>
     </SetProperty>
 "@
-                    $SetProperty.Add($xml)
-                    $x++
-                }
+                $SetProperty.Add($xml)
+                $x++
             }
 
             if (($SetProperty | Measure-Object).Count -eq 0) {
@@ -135,7 +156,10 @@ function Set-CIPPSPOTenant {
         }
 
         if ($PSCmdlet.ShouldProcess($Description, 'Set Tenant Properties')) {
-            New-GraphPostRequest -scope "$AdminURL/.default" -tenantid $TenantFilter -Uri "$AdminURL/_vti_bin/client.svc/ProcessQuery" -Type POST -Body $XML -ContentType 'text/xml' -AddedHeaders $AdditionalHeaders
+            $Response = New-GraphPostRequest -scope "$AdminURL/.default" -tenantid $TenantFilter -Uri "$AdminURL/_vti_bin/client.svc/ProcessQuery" -Type POST -Body $XML -ContentType 'text/xml' -AddedHeaders $AdditionalHeaders @AuthSplat
+            # CSOM reports a rejected write as HTTP 200 with ErrorInfo in the body
+            $CsomError = (@($Response).Where({ $_.ErrorInfo }) | Select-Object -First 1).ErrorInfo.ErrorMessage
+            if ($CsomError) { throw $CsomError }
 
             # Invalidate cached tenant data so subsequent reads reflect the change
             $Table = Get-CIPPTable -tablename 'cachespotenant'
@@ -144,6 +168,7 @@ function Set-CIPPSPOTenant {
             if ($CacheEntity) {
                 Remove-CIPPAzDataTableEntity @Table -Entity $CacheEntity
             }
+            $Response
         }
     }
 }

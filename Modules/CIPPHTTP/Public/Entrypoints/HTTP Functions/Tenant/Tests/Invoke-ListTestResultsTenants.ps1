@@ -21,15 +21,26 @@ function Invoke-ListTestResultsTenants {
     $APIName = $TriggerMetadata.FunctionName
 
     try {
+        # One or more tenant domains to report on. Omit, or pass 'AllTenants', to query every
+        # tenant the caller may see. Accepts a string, a comma-delimited string, or an array.
         $TenantFilterRaw = $Request.Query.tenantFilter ?? $Request.Body.tenantFilter
+        # One or more test IDs (the result row's RowKey), e.g. 'CustomScript-<guid>'.
         $TestIdRaw = $Request.Query.testId ?? $Request.Body.testId
+        # Narrow the scan to these statuses: Passed, Failed, Investigate, Skipped, Informational and Unlicensed.
         $StatusRaw = $Request.Query.status ?? $Request.Body.status
+        # Restrict to a single test type: Identity, Devices or Custom.
         $TestType = $Request.Query.testType ?? $Request.Body.testType
+        # Restrict to a single risk level: High, Medium or Low.
         $Risk = $Request.Query.risk ?? $Request.Body.risk
+        # Restrict to a single category (the framework/area name a test belongs to).
         $Category = $Request.Query.category ?? $Request.Body.category
+        # 'true' to project away the large ResultMarkdown/ResultDataJson blobs for a lighter read.
         $SummaryOnly = $Request.Query.summaryOnly ?? $Request.Body.summaryOnly
+        # Return rows only for these statuses, while still counting every status the filters match.
         $RowStatusRaw = $Request.Query.rowStatus ?? $Request.Body.rowStatus
+        # 'true' to also return aggregate counts (per status, high-risk failures, distinct tenants).
         $IncludeCounts = $Request.Query.includeCounts ?? $Request.Body.includeCounts
+        # 'true' to return only the aggregate counts with no rows. Implies includeCounts.
         $CountsOnly = $Request.Query.countsOnly ?? $Request.Body.countsOnly
 
         # Normalise inputs that may arrive as a single string, a comma-delimited string, or an
@@ -65,7 +76,14 @@ function Invoke-ListTestResultsTenants {
         # permitted customerIds, or 'AllTenants' for unrestricted users. Passed into the query so
         # disallowed tenants are dropped before any counting or row building — a post-hoc filter
         # would leak estate size through the counts and burn time filtering rows at scale.
-        $AllowedTenants = Test-CIPPAccess -Request $Request -TenantList
+        try {
+            $AllowedTenants = Test-CIPPAccess -Request $Request -TenantList
+        } catch {
+            return ([HttpResponseContext]@{
+                    StatusCode = [HttpStatusCode]::Forbidden
+                    Body       = @{ Error = $_.Exception.Message }
+                })
+        }
         if ($AllowedTenants -notcontains 'AllTenants') {
             $Params.AllowedTenantIds = @($AllowedTenants | Where-Object { $_ })
         }
@@ -81,7 +99,7 @@ function Invoke-ListTestResultsTenants {
     } catch {
         $ErrorMessage = Get-CippException -Exception $_
         Write-LogMessage -API $APIName -message "Error retrieving cross-tenant test results: $($ErrorMessage.NormalizedError)" -sev Error -LogData $ErrorMessage
-        $StatusCode = [HttpStatusCode]::BadRequest
+        $StatusCode = [HttpStatusCode]::InternalServerError
         $Body = @{ Error = $ErrorMessage.NormalizedError }
     }
 

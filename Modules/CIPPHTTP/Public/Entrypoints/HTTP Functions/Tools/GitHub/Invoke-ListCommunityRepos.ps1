@@ -7,7 +7,7 @@ function Invoke-ListCommunityRepos {
     .FUNCTIONALITY
         Entrypoint,AnyTenant
     .ROLE
-        CIPP.Core.Read
+        CIPP.TemplateLibrary.Read
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -21,6 +21,16 @@ function Invoke-ListCommunityRepos {
     }
 
     $Repos = Get-CIPPAzDataTableEntity @Table -Filter $Filter
+
+    # Rows with an empty RowKey came from an Add that got no repository back from GitHub. They
+    # render as a nameless card and cannot be deleted by Id, so clear them here.
+    $Ghosts = @($Repos | Where-Object { [string]::IsNullOrEmpty($_.RowKey) })
+    if ($Ghosts.Count -gt 0) {
+        foreach ($Ghost in $Ghosts) {
+            Remove-AzDataTableEntity @Table -Entity ($Ghost | Select-Object PartitionKey, RowKey, ETag) -Force
+        }
+        $Repos = @($Repos | Where-Object { -not [string]::IsNullOrEmpty($_.RowKey) })
+    }
 
     if (!$Request.Query.WriteAccess) {
         $CommunityRepos = Join-Path $env:CIPPRootPath 'Config\CommunityRepos.json'
@@ -51,10 +61,12 @@ function Invoke-ListCommunityRepos {
                 $DefaultsChanged = $true
             } elseif ($Existing.TemplateTypes -ne $TemplateTypesJson -or $Existing.BuiltIn -ne $Repo.BuiltIn -or $Existing.Description -ne $Repo.Description -or $Existing.Name -ne $Repo.Name) {
                 # Upgrade path: sync built-in metadata onto rows seeded by older versions
-                $Existing | Add-Member -NotePropertyName 'TemplateTypes' -NotePropertyValue $TemplateTypesJson -Force
-                $Existing | Add-Member -NotePropertyName 'BuiltIn' -NotePropertyValue $Repo.BuiltIn -Force
-                $Existing | Add-Member -NotePropertyName 'Description' -NotePropertyValue $Repo.Description -Force
-                $Existing | Add-Member -NotePropertyName 'Name' -NotePropertyValue $Repo.Name -Force
+                $Existing | Add-Member -NotePropertyMembers ([ordered]@{
+                        TemplateTypes = $TemplateTypesJson
+                        BuiltIn       = $Repo.BuiltIn
+                        Description   = $Repo.Description
+                        Name          = $Repo.Name
+                    }) -Force
                 Add-CIPPAzDataTableEntity @Table -Entity $Existing -Force
                 $DefaultsChanged = $true
             }

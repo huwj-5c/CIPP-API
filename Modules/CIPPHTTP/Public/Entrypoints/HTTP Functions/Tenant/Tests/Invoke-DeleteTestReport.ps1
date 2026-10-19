@@ -9,7 +9,6 @@ function Invoke-DeleteTestReport {
     param($Request, $TriggerMetadata)
 
     $APIName = $TriggerMetadata.FunctionName
-    Write-LogMessage -user $Request.Headers.'x-ms-client-principal' -API $APIName -message 'Accessed this API' -Sev 'Debug'
 
     try {
         $ReportId = $Request.Body.ReportId
@@ -17,17 +16,19 @@ function Invoke-DeleteTestReport {
         $ExistingReport = Get-CIPPAzDataTableEntity @Table -Filter "RowKey eq '$ReportId'"
         Remove-CIPPAzDataTableEntity @Table -Entity $ExistingReport
 
+        $Result = 'Successfully deleted custom report'
+        Write-LogMessage -user $Request.Headers.'x-ms-client-principal' -API $APIName -tenant 'Global' -message $Result -Sev 'Info'
         $Body = [PSCustomObject]@{
-            Results = 'Successfully deleted custom report'
+            Results = $Result
         }
         $StatusCode = [HttpStatusCode]::OK
     } catch {
         $ErrorMessage = Get-CippException -Exception $_
-        Write-LogMessage -user $Request.Headers.'x-ms-client-principal' -API $APIName -message "Failed to delete report: $($ErrorMessage.NormalizedError)" -Sev 'Error' -LogData $ErrorMessage
+        Write-LogMessage -user $Request.Headers.'x-ms-client-principal' -API $APIName -tenant 'Global' -message "Failed to delete report: $($ErrorMessage.NormalizedError)" -Sev 'Error' -LogData $ErrorMessage
         $Body = [PSCustomObject]@{
             Results = "Failed to delete report: $($ErrorMessage.NormalizedError)"
         }
-        $StatusCode = [HttpStatusCode]::BadRequest
+        $StatusCode = [HttpStatusCode]::InternalServerError
     }
 
     return ([HttpResponseContext]@{

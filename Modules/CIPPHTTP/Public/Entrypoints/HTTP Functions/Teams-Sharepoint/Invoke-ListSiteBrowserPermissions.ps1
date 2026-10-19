@@ -153,10 +153,10 @@ function Invoke-ListSiteBrowserPermissions {
     $IsLibrary = -not [string]::IsNullOrWhiteSpace($ListId)
 
     try {
-        $SharePointInfo = Get-SharePointAdminLink -Public $false -tenantFilter $TenantFilter
-        $SpoScope = "$($SharePointInfo.SharePointUrl)/.default"
-        $JsonAccept = @{ Accept = 'application/json;odata=nometadata' }
-        $BaseUri = "$($SiteUrl.TrimEnd('/'))/_api"
+        $RestContext = Resolve-CIPPSharePointRestContext -TenantFilter $TenantFilter -SiteUrl $SiteUrl
+        $SpoScope = $RestContext.Scope
+        $JsonAccept = $RestContext.Headers
+        $BaseUri = $RestContext.BaseUri
 
         # --- Target / inheritance ---
         $TargetTitle = $null
@@ -164,8 +164,19 @@ function Invoke-ListSiteBrowserPermissions {
         if ($IsLibrary) {
             try {
                 $ListInfo = New-GraphGetRequest -uri "$BaseUri/web/lists(guid'$ListId')?`$select=HasUniqueRoleAssignments,Title,Id" -tenantid $TenantFilter -scope $SpoScope -extraHeaders $JsonAccept -UseCertificate -AsApp $true
-                $HasUniqueRoleAssignments = [bool]$ListInfo.HasUniqueRoleAssignments
                 $TargetTitle = $ListInfo.Title
+                # [bool]$null is $false — that hides "Fix inheritance" when the property is not
+                # projected. Probe the scalar endpoint before treating the library as inheriting.
+                $HasUniqueRaw = $ListInfo.HasUniqueRoleAssignments
+                if ($null -eq $HasUniqueRaw) {
+                    try {
+                        $Probe = New-GraphGetRequest -uri "$BaseUri/web/lists(guid'$ListId')/HasUniqueRoleAssignments" -tenantid $TenantFilter -scope $SpoScope -extraHeaders $JsonAccept -UseCertificate -AsApp $true
+                        $HasUniqueRaw = if ($null -ne $Probe.PSObject.Properties['value']) { $Probe.value } else { $Probe }
+                    } catch {
+                        $HasUniqueRaw = $null
+                    }
+                }
+                $HasUniqueRoleAssignments = $HasUniqueRaw -eq $true -or "$HasUniqueRaw" -eq 'true'
             } catch {
                 $Errors.Add([PSCustomObject]@{ section = 'target'; message = $_.Exception.Message })
             }
@@ -370,12 +381,12 @@ function Invoke-ListSiteBrowserPermissions {
             collectedAt            = (Get-Date).ToUniversalTime().ToString('o')
         }
 
-        $StatusCode = [HttpStatusCode]::OK
+        $StatusCode = if ($Errors.Count -gt 0) { [HttpStatusCode]::MultiStatus } else { [HttpStatusCode]::OK }
     } catch {
         $ErrorMessage = Get-CippException -Exception $_
         $Body = "Failed to list site browser permissions: $($ErrorMessage.NormalizedError)"
         Write-LogMessage -Headers $Request.Headers -API $APIName -tenant $TenantFilter -message $Body -sev Error -LogData $ErrorMessage
-        $StatusCode = [HttpStatusCode]::BadRequest
+        $StatusCode = [HttpStatusCode]::InternalServerError
     }
 
     return ([HttpResponseContext]@{

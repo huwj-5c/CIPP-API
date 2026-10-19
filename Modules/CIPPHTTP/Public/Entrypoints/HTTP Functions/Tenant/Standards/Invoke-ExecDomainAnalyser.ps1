@@ -9,7 +9,9 @@ function Invoke-ExecDomainAnalyser {
     param($Request, $TriggerMetadata)
 
     # Call the wrapper - it handles queuing internally via Start-CIPPOrchestrator
-    $Params = @{}
+    $Params = @{
+        SkipExchangeFilter = $true
+    }
     if ($Request.Body.tenantFilter) {
         $Params.TenantFilter = $Request.Body.tenantFilter.value ?? $Request.Body.tenantFilter
     }
@@ -27,7 +29,9 @@ function Invoke-ExecDomainAnalyser {
     }
 
     $OrchStatus = Start-DomainOrchestrator @Params
-    if ($OrchStatus) {
+    if ("$OrchStatus" -like '*-Skipped') {
+        $Message = 'A Domain Analyser run for all tenants is already running, so this request was skipped'
+    } elseif ($OrchStatus) {
         $Message = 'Domain Analyser started'
     } else {
         $Message = 'Domain Analyser error: check logs'

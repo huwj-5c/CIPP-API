@@ -24,6 +24,9 @@ function Set-CIPPDBCacheIntuneAppleUserInitiatedEnrollmentProfiles {
         $TestResult = Test-CIPPStandardLicense -StandardName 'IntuneAppleEnrollmentProfilesCache' -TenantFilter $TenantFilter -Preset Intune -SkipLog
         if ($TestResult -eq $false) {
             Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message 'Tenant does not have Intune license, skipping Apple enrollment type profiles cache' -sev Debug
+            # A license skip is still a completed collection: record the authoritative empty set
+            # so collect-on-miss does not re-run this collector forever on unlicensed tenants.
+            Add-CIPPDbItem -TenantFilter $TenantFilter -Type 'IntuneAppleUserInitiatedEnrollmentProfiles' -Data @() -AddCount -ClearOnEmpty
             return
         }
 
@@ -50,7 +53,7 @@ function Set-CIPPDBCacheIntuneAppleUserInitiatedEnrollmentProfiles {
                         continue
                     }
 
-                    $EnrollmentProfile = $Profiles | Where-Object { $_.id -eq $AssignResult.id } | Select-Object -First 1
+                    $EnrollmentProfile = $Profiles.Where({ $_.id -eq $AssignResult.id }, 'First')[0]
                     if ($EnrollmentProfile) {
                         $Assignments = @($AssignResult.body.value)
                         $EnrollmentProfile | Add-Member -NotePropertyName assignments -NotePropertyValue $Assignments -Force

@@ -19,13 +19,15 @@ function Invoke-ListSiteRoleDefinitions {
     $SiteUrl = $Request.Query.SiteUrl ?? $Request.Body.SiteUrl
     $IncludeUnassignable = ($Request.Query.IncludeUnassignable ?? $Request.Body.IncludeUnassignable) -eq $true
 
-    try {
-        if ([string]::IsNullOrWhiteSpace($SiteUrl)) { throw 'SiteUrl is required.' }
+    if ([string]::IsNullOrWhiteSpace($SiteUrl)) {
+        return ([HttpResponseContext]@{ StatusCode = [HttpStatusCode]::BadRequest; Body = @{ 'Results' = 'SiteUrl is required.' } })
+    }
 
-        $SharePointInfo = Get-SharePointAdminLink -Public $false -tenantFilter $TenantFilter
-        $Scope = "$($SharePointInfo.SharePointUrl)/.default"
-        $JsonAccept = @{ Accept = 'application/json;odata=nometadata' }
-        $BaseUri = "$($SiteUrl.TrimEnd('/'))/_api"
+    try {
+        $RestContext = Resolve-CIPPSharePointRestContext -TenantFilter $TenantFilter -SiteUrl $SiteUrl
+        $Scope = $RestContext.Scope
+        $JsonAccept = $RestContext.Headers
+        $BaseUri = $RestContext.BaseUri
 
         $RoleDefinitions = @(New-GraphGetRequest -uri "$BaseUri/web/roledefinitions?`$select=Id,Name,Description,RoleTypeKind,Hidden,Order" -tenantid $TenantFilter -scope $Scope -extraHeaders $JsonAccept -UseCertificate -AsApp $true)
 
@@ -47,7 +49,7 @@ function Invoke-ListSiteRoleDefinitions {
         $ErrorMessage = Get-CippException -Exception $_
         $Results = "Failed to list permission levels: $($ErrorMessage.NormalizedError)"
         Write-LogMessage -Headers $Request.Headers -API $APIName -tenant $TenantFilter -message $Results -sev Error -LogData $ErrorMessage
-        $StatusCode = [HttpStatusCode]::BadRequest
+        $StatusCode = [HttpStatusCode]::InternalServerError
     }
 
     return ([HttpResponseContext]@{

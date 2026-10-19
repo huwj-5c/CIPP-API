@@ -5,7 +5,7 @@
 
 BeforeAll {
     $script:RepoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSCommandPath))
-    $Baselines = Join-Path $script:RepoRoot 'Modules/CIPPCore/Public/Baselines'
+    $Baselines = Join-Path $script:RepoRoot 'Modules/CIPPBaselines/Public'
 
     function New-CIPPDbRequest { param($TenantFilter, $Type) }
     function Write-LogMessage { param($API, $tenant, $message, $Sev, $LogData) }
@@ -15,19 +15,21 @@ BeforeAll {
     function New-GraphGetRequest { param($uri, $tenantid, $AsApp) }
     function New-GraphBulkRequest { param($tenantid, $Requests) }
     function Get-CIPPSPOTenant { param($TenantFilter) }
-    function Set-CIPPSPOTenant { [CmdletBinding()] param([Parameter(ValueFromPipeline = $true)]$InputObject, $Properties, $MethodName, $MethodParameters) process { } }
+    function Set-CIPPSPOTenant { [CmdletBinding()] param([Parameter(ValueFromPipeline = $true)]$InputObject, $Properties, $MethodName, $MethodParameters, [switch]$UseCertificate) process { } }
     function Set-CIPPSPOSite { param($TenantFilter, $SiteUrl, $Properties) }
+    function Set-CIPPSPOSiteBulk { [CmdletBinding()] param($TenantFilter, $Sites, $MaxConcurrency, $MaxRetries, [switch]$UseCertificate) }
     function Get-CIPPTextReplacement { param($TenantFilter, $Text) $Text }
     function Get-NormalizedError { param($Message) "$Message" }
 
     . (Join-Path $script:RepoRoot 'Modules/CIPPCore/Public/Get-CIPPIntuneCompareExclusions.ps1')
     . (Join-Path $script:RepoRoot 'Modules/CIPPCore/Public/Compare-CIPPIntuneObject.ps1')
-    . (Join-Path $Baselines 'Get-CIPPBaselineCacheRows.ps1')
-    . (Join-Path $Baselines 'Test-CIPPBaselineCacheCollected.ps1')
+    . (Join-Path $Baselines 'Helpers/Get-CIPPBaselineCommand.ps1')
+    . (Join-Path $Baselines 'Helpers/Get-CIPPBaselineCacheRows.ps1')
+    . (Join-Path $Baselines 'Helpers/Test-CIPPBaselineCacheCollected.ps1')
     foreach ($Name in @('ExcludedfileExt', 'sharingDomainRestriction', 'SPDirectSharing', 'SPOVersionControl',
             'MailContacts', 'ProfilePhotos', 'SecureScoreRemediation')) {
-        . (Join-Path $Baselines "Get-CIPPBaseline${Name}State.ps1")
-        . (Join-Path $Baselines "Invoke-CIPPBaseline${Name}.ps1")
+        . (Join-Path $Baselines "PrepareHooks/Get-CIPPBaseline${Name}State.ps1")
+        . (Join-Path $Baselines "Executors/Invoke-CIPPBaseline${Name}.ps1")
     }
 
     $script:Tenant = 'contoso.onmicrosoft.com'
@@ -160,10 +162,36 @@ Describe 'Get-CIPPBaselineSPOVersionControlState' {
         Mock Get-CIPPSPOTenant { [PSCustomObject]@{ _ObjectIdentity_ = 'fresh'; TenantFilter = $script:Tenant } }
         Mock Set-CIPPSPOTenant { }
         Mock New-GraphGetRequest { @([PSCustomObject]@{ webUrl = 'https://c.sharepoint.com/sites/bad' }, [PSCustomObject]@{ webUrl = 'https://c.sharepoint.com/sites/good' }) }
-        Mock Set-CIPPSPOSite { if ($SiteUrl -like '*bad') { throw 'site locked' } }
+        # The fan-out is now one concurrent Set-CIPPSPOSiteBulk call; a per-site failure comes back
+        # as Success=$false in its result rather than a thrown exception, and must not abort the run.
+        Mock Set-CIPPSPOSiteBulk {
+            @(foreach ($Site in $Sites) {
+                    [PSCustomObject]@{ SiteUrl = $Site.SiteUrl; Success = ($Site.SiteUrl -notlike '*bad'); Error = if ($Site.SiteUrl -like '*bad') { 'site locked' } else { $null } }
+                })
+        }
+        { Invoke-CIPPBaselineSPOVersionControl -Remediate ([PSCustomObject]@{ enableAutoTrim = $true; applyToExistingSites = $true }) -TenantFilter $script:Tenant -Current $null } | Should -Not -Throw
+        Should -Invoke Set-CIPPSPOSiteBulk -Times 1 -Exactly
+        Should -Invoke Set-CIPPSPOSiteBulk -Times 1 -Exactly -ParameterFilter {
+            @($Sites).Count -eq 2 -and @($Sites | Where-Object { $_.SiteUrl -like '*good' -and $_.Properties.InheritVersionPolicyFromTenant -eq $false }).Count -eq 1
+        }
+    }
+
+    It 'queues existing libraries with an explicit policy and leaves new libraries inheriting' {
+        Mock Get-CIPPSPOTenant { [PSCustomObject]@{ _ObjectIdentity_ = 'fresh'; TenantFilter = $script:Tenant } }
+        Mock Set-CIPPSPOTenant { }
+        Mock New-GraphGetRequest { @([PSCustomObject]@{ webUrl = 'https://c.sharepoint.com/sites/a' }) }
+        $script:Sent = $null
+        Mock Set-CIPPSPOSiteBulk { $script:Sent = $Sites[0].Properties; @([PSCustomObject]@{ SiteUrl = $Sites[0].SiteUrl; Success = $true }) }
+
         Invoke-CIPPBaselineSPOVersionControl -Remediate ([PSCustomObject]@{ enableAutoTrim = $true; applyToExistingSites = $true }) -TenantFilter $script:Tenant -Current $null
-        Should -Invoke Set-CIPPSPOSite -Times 2 -Exactly
-        Should -Invoke Set-CIPPSPOSite -Times 1 -Exactly -ParameterFilter { $SiteUrl -like '*good' -and $Properties.InheritVersionPolicyFromTenant -eq $true }
+        $script:Sent.ApplyToExistingDocumentLibraries | Should -BeTrue
+        $script:Sent.ContainsKey('ApplyToNewDocumentLibraries') | Should -BeFalse
+        @($script:Sent.MajorVersionLimit, $script:Sent.ExpireVersionsAfterDays, $script:Sent.MajorWithMinorVersionsLimit) | Should -Be @(-1, -1, -1)
+
+        Invoke-CIPPBaselineSPOVersionControl -Remediate ([PSCustomObject]@{ enableAutoTrim = $false; majorVersionLimit = 100; expireVersionsAfterDays = 0; applyToExistingSites = $true }) -TenantFilter $script:Tenant -Current $null
+        $script:Sent.EnableAutoExpirationVersionTrim | Should -BeFalse
+        $script:Sent.MajorVersionLimit | Should -Be 100
+        $script:Sent.ContainsKey('MajorWithMinorVersionsLimit') | Should -BeFalse
     }
 }
 

@@ -10,6 +10,11 @@ function Set-CIPPDBCacheIntuneAppProtectionPolicies {
         $TestResult = Test-CIPPStandardLicense -StandardName 'IntuneAppProtectionPoliciesCache' -TenantFilter $TenantFilter -Preset Intune -SkipLog
         if ($TestResult -eq $false) {
             Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message 'Tenant does not have Intune license, skipping app protection policies cache' -sev Debug
+            # A license skip is still a completed collection: record authoritative empty sets for
+            # every type this collector writes so collect-on-miss does not re-run it forever.
+            Add-CIPPDbItem -TenantFilter $TenantFilter -Type 'IntuneAppProtectionPolicyGroups' -Data @() -AddCount -ClearOnEmpty
+            Add-CIPPDbItem -TenantFilter $TenantFilter -Type 'IntuneAppProtectionManagedAppPolicies' -Data @() -AddCount -ClearOnEmpty
+            Add-CIPPDbItem -TenantFilter $TenantFilter -Type 'IntuneAppProtectionMobileAppConfigurations' -Data @() -AddCount -ClearOnEmpty
             return
         }
 
@@ -39,7 +44,7 @@ function Set-CIPPDBCacheIntuneAppProtectionPolicies {
         # treats a fresh empty cache as authoritative (baseline drift detection).
         $GetChecked = {
             param($Results, $Id)
-            $Result = $Results | Where-Object { $_.id -eq $Id } | Select-Object -First 1
+            $Result = $Results.Where({ $_.id -eq $Id }, 'First')[0]
             if (-not $Result -or $null -eq $Result.status -or [int]$Result.status -lt 200 -or [int]$Result.status -ge 300) {
                 $GraphError = $Result.body.error.message ?? $Result.body.message ?? 'no batch response'
                 throw "Graph request '$Id' failed (HTTP $($Result.status)): $GraphError - preserving the previous cache"

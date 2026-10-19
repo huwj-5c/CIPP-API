@@ -5,24 +5,25 @@
 
 BeforeAll {
     $script:RepoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSCommandPath))
-    $Baselines = Join-Path $script:RepoRoot 'Modules/CIPPCore/Public/Baselines'
+    $Baselines = Join-Path $script:RepoRoot 'Modules/CIPPBaselines/Public'
 
     function New-CIPPDbRequest { param($TenantFilter, $Type) }
     function Write-LogMessage { param($API, $tenant, $message, $Sev, $LogData) }
     function Get-CIPPDbItem { param($TenantFilter, $Type, [switch]$CountsOnly) }
     function New-ExoRequest { param($tenantid, $cmdlet, $cmdParams, $useSystemMailbox) }
-    function New-ExoBulkRequest { param($tenantid, $cmdletArray, $useSystemMailbox, $ReturnWithCommand) }
+    function New-ExoBulkRequest { param($tenantid, $cmdletArray, $useSystemMailbox, $ReturnWithCommand, $MaxConcurrency, [switch]$AnchorPerMailbox) }
     function Get-CIPPTextReplacement { param($TenantFilter, $Text) $Text }
     function Get-NormalizedError { param($Message) "$Message" }
 
     . (Join-Path $script:RepoRoot 'Modules/CIPPCore/Public/Get-CIPPIntuneCompareExclusions.ps1')
     . (Join-Path $script:RepoRoot 'Modules/CIPPCore/Public/Compare-CIPPIntuneObject.ps1')
-    . (Join-Path $Baselines 'Get-CIPPBaselineCacheRows.ps1')
-    . (Join-Path $Baselines 'Test-CIPPBaselineCacheCollected.ps1')
+    . (Join-Path $Baselines 'Helpers/Get-CIPPBaselineCommand.ps1')
+    . (Join-Path $Baselines 'Helpers/Get-CIPPBaselineCacheRows.ps1')
+    . (Join-Path $Baselines 'Helpers/Test-CIPPBaselineCacheCollected.ps1')
     foreach ($Name in @('GlobalQuarantineSettings', 'GlobalQuarantineNotifications', 'UserSubmissions', 'RetentionPolicyTag',
             'SendReceiveLimitTenant', 'AddDKIM', 'RotateDKIM', 'PhishSimSpoofIntelligence', 'PhishingSimulations')) {
-        . (Join-Path $Baselines "Get-CIPPBaseline${Name}State.ps1")
-        . (Join-Path $Baselines "Invoke-CIPPBaseline${Name}.ps1")
+        . (Join-Path $Baselines "PrepareHooks/Get-CIPPBaseline${Name}State.ps1")
+        . (Join-Path $Baselines "Executors/Invoke-CIPPBaseline${Name}.ps1")
     }
 
     $script:Tenant = 'contoso.onmicrosoft.com'
@@ -126,6 +127,31 @@ Describe 'Get-CIPPBaselineUserSubmissionsState' {
         $Current = [PSCustomObject]@{ policyExists = $true; ruleExists = $true; ruleEnabled = $true; resolvedEmail = '' }
         Invoke-CIPPBaselineUserSubmissions -Remediate ([PSCustomObject]@{ state = 'disable' }) -TenantFilter $script:Tenant -Current $Current
         Should -Invoke New-ExoRequest -Times 1 -Exactly -ParameterFilter { $cmdlet -eq 'Remove-ReportSubmissionRule' }
+    }
+
+    It 'grades reporting-to-Microsoft OFF as compliant for the mailbox-only destination, and as drift without it' {
+        # Issue #409: tenants using a third-party phishing service keep EnableReportToMicrosoft
+        # off - the mailbox-only destination must not read that as drift.
+        Mock New-CIPPDbRequest {
+            if ($Type -eq 'ReportSubmissionPolicy') { @(@{ EnableReportToMicrosoft = $false; ReportJunkToCustomizedAddress = $true; ReportJunkAddresses = @('soc@contoso.com'); ReportNotJunkToCustomizedAddress = $true; ReportNotJunkAddresses = @('soc@contoso.com'); ReportPhishToCustomizedAddress = $true; ReportPhishAddresses = @('soc@contoso.com') } | ConvertTo-Cached) }
+            else { @(@{ State = 'Enabled'; SentTo = @('soc@contoso.com') } | ConvertTo-Cached) }
+        }
+        $Item = [PSCustomObject]@{ Variables = [PSCustomObject]@{ state = 'enable'; email = 'soc@contoso.com'; reportDestination = 'Mailbox' } }
+        $Prepared = Get-CIPPBaselineUserSubmissionsState -Item $Item -TenantFilter $script:Tenant
+        (Get-Verdict -Expected $Prepared.Expected -Current $Prepared.Current).Count | Should -Be 0
+
+        $Legacy = [PSCustomObject]@{ Variables = [PSCustomObject]@{ state = 'enable'; email = 'soc@contoso.com' } }
+        $Prepared = Get-CIPPBaselineUserSubmissionsState -Item $Legacy -TenantFilter $script:Tenant
+        (Get-Verdict -Expected $Prepared.Expected -Current $Prepared.Current).Count | Should -BeGreaterThan 0
+    }
+
+    It 'writes EnableReportToMicrosoft false when remediating the mailbox-only destination' {
+        Mock New-ExoRequest { }
+        $Current = [PSCustomObject]@{ policyExists = $true; ruleExists = $true; ruleEnabled = $true; resolvedEmail = 'soc@contoso.com'; reportDestination = 'Mailbox' }
+        Invoke-CIPPBaselineUserSubmissions -Remediate ([PSCustomObject]@{ state = 'enable' }) -TenantFilter $script:Tenant -Current $Current
+        Should -Invoke New-ExoRequest -Times 1 -Exactly -ParameterFilter {
+            $cmdlet -eq 'Set-ReportSubmissionPolicy' -and $cmdParams.EnableReportToMicrosoft -eq $false -and $cmdParams.ReportPhishAddresses -eq 'soc@contoso.com'
+        }
     }
 }
 
@@ -264,7 +290,7 @@ Describe 'Get-CIPPBaselinePhishingSimulationsState' {
 
 Describe 'Get-CIPPBaselineSpamFilterPolicyState block-list write params' {
     BeforeAll {
-        . (Join-Path (Join-Path $script:RepoRoot 'Modules/CIPPCore/Public/Baselines') 'Get-CIPPBaselineSpamFilterPolicyState.ps1')
+        . (Join-Path (Join-Path $script:RepoRoot 'Modules/CIPPBaselines/Public') 'PrepareHooks/Get-CIPPBaselineSpamFilterPolicyState.ps1')
         $script:SpamPolicy = @{ Name = 'CIPP Default Spam Filter Policy'; EnableRegionBlockList = $true; EnableLanguageBlockList = $false }
         $script:SpamRule = @{ Name = 'CIPP Default Spam Filter Policy'; State = 'Enabled'; Priority = 0; HostedContentFilterPolicy = 'CIPP Default Spam Filter Policy'; RecipientDomainIs = @('contoso.com') }
     }
@@ -298,5 +324,74 @@ Describe 'Get-CIPPBaselineSpamFilterPolicyState block-list write params' {
         $Prepared.Current.extraPolicyParams.EnableRegionBlockList | Should -BeTrue
         @($Prepared.Current.extraPolicyParams.RegionBlockList) | Should -BeExactly @('KP', 'RU')
         $Prepared.Expected.enableRegionBlockList | Should -BeTrue
+    }
+
+    It 'never grades or writes BulkMovesEnabled unless explicitly configured - the parameter is in Preview and not available in every organization' {
+        $Item = [PSCustomObject]@{ Variables = [PSCustomObject]@{ } }
+        $Prepared = Get-CIPPBaselineSpamFilterPolicyState -Item $Item -TenantFilter $script:Tenant
+        $Prepared.Expected.PSObject.Properties.Name | Should -Not -Contain 'bulkMovesEnabled'
+        $Prepared.Current.extraPolicyParams.PSObject.Properties.Name | Should -Not -Contain 'BulkMovesEnabled'
+    }
+
+    It 'grades and writes BulkMovesEnabled when configured On, unwrapping an option wrapper if the picker saved one' {
+        $Item = [PSCustomObject]@{ Variables = [PSCustomObject]@{ BulkMovesEnabled = [PSCustomObject]@{ label = 'On'; value = 'On' } } }
+        $Prepared = Get-CIPPBaselineSpamFilterPolicyState -Item $Item -TenantFilter $script:Tenant
+        $Prepared.Expected.bulkMovesEnabled | Should -BeExactly 'On'
+        $Prepared.Current.extraPolicyParams.BulkMovesEnabled | Should -BeExactly 'On'
+    }
+}
+
+Describe 'Get-CIPPBaselineMailboxDefaultAuditSetState' {
+    BeforeAll {
+        . (Join-Path $script:RepoRoot 'Modules/CIPPBaselines/Public/PrepareHooks/Get-CIPPBaselineMailboxDefaultAuditSetState.ps1')
+        . (Join-Path $script:RepoRoot 'Modules/CIPPBaselines/Public/Executors/Invoke-CIPPBaselineMailboxDefaultAuditSet.ps1')
+        $script:AuditMailboxes = @(
+            @{ UPN = 'default@contoso.com'; recipientTypeDetails = 'UserMailbox'; DefaultAuditSet = @('Admin', 'Delegate', 'Owner') }
+            @{ UPN = 'owner@contoso.com'; recipientTypeDetails = 'UserMailbox'; DefaultAuditSet = @('Admin', 'Delegate') }
+            @{ UPN = 'shared@contoso.com'; recipientTypeDetails = 'SharedMailbox'; DefaultAuditSet = @() }
+            @{ UPN = 'room@contoso.com'; recipientTypeDetails = 'RoomMailbox'; DefaultAuditSet = @('Owner') }
+            @{ UPN = 'discovery@contoso.com'; recipientTypeDetails = 'DiscoveryMailbox'; DefaultAuditSet = @() }
+        ) | ConvertTo-Cached
+    }
+
+    It 'offends every mailbox type it can write that is missing any default sign-in type' {
+        Mock New-CIPPDbRequest { $script:AuditMailboxes }
+        $Prepared = Get-CIPPBaselineMailboxDefaultAuditSetState -Item ([PSCustomObject]@{}) -TenantFilter $script:Tenant
+        $Prepared.Current.offenders | Should -Be @('owner@contoso.com', 'room@contoso.com', 'shared@contoso.com')
+        (Get-Verdict -Expected ([PSCustomObject]@{ offenders = @() }) -Current $Prepared.Current).Count | Should -BeGreaterThan 0
+    }
+
+    It 'is compliant when every mailbox still uses the default set' {
+        Mock New-CIPPDbRequest { @($script:AuditMailboxes[0]) }
+        $Prepared = Get-CIPPBaselineMailboxDefaultAuditSetState -Item ([PSCustomObject]@{}) -TenantFilter $script:Tenant
+        (Get-Verdict -Expected ([PSCustomObject]@{ offenders = @() }) -Current $Prepared.Current).Count | Should -Be 0
+    }
+
+    It 'reports No Data when the cache is empty' {
+        Mock New-CIPPDbRequest { @() }
+        (Get-CIPPBaselineMailboxDefaultAuditSetState -Item ([PSCustomObject]@{}) -TenantFilter $script:Tenant).Current | Should -BeNullOrEmpty
+    }
+
+    It 'writes Set-Mailbox -DefaultAuditSet Admin,Delegate,Owner anchored to each mailbox, concurrently' {
+        Mock New-ExoBulkRequest {}
+        $Current = [PSCustomObject]@{ targets = @([PSCustomObject]@{ id = 'a@contoso.com' }, [PSCustomObject]@{ id = 'b@contoso.com' }) }
+        Invoke-CIPPBaselineMailboxDefaultAuditSet -Remediate $null -TenantFilter $script:Tenant -Current $Current
+        Should -Invoke New-ExoBulkRequest -Times 1 -ParameterFilter {
+            $AnchorPerMailbox -and $MaxConcurrency -eq 10 -and @($cmdletArray).Count -eq 2 -and
+            @($cmdletArray)[1].OperationGuid -eq 'b@contoso.com' -and
+            @($cmdletArray)[1].CmdletInput.CmdletName -eq 'Set-Mailbox' -and
+            @($cmdletArray)[1].CmdletInput.Parameters.Identity -eq 'b@contoso.com' -and
+            (@($cmdletArray)[1].CmdletInput.Parameters.DefaultAuditSet -join ',') -eq 'Admin,Delegate,Owner'
+        }
+    }
+
+    It 'continues past a failed mailbox and throws only when every write failed' {
+        Mock Write-LogMessage {}
+        $Current = [PSCustomObject]@{ targets = @([PSCustomObject]@{ id = 'a@contoso.com' }, [PSCustomObject]@{ id = 'b@contoso.com' }) }
+        Mock New-ExoBulkRequest { @([PSCustomObject]@{ error = 'proxy'; OperationGuid = 'a@contoso.com' }, [PSCustomObject]@{ Success = $true; OperationGuid = 'b@contoso.com' }) }
+        { Invoke-CIPPBaselineMailboxDefaultAuditSet -Remediate $null -TenantFilter $script:Tenant -Current $Current } | Should -Not -Throw
+        Should -Invoke Write-LogMessage -Times 1 -ParameterFilter { $message -like '*1 of 2*a@contoso.com -> proxy*' }
+        Mock New-ExoBulkRequest { @([PSCustomObject]@{ error = 'proxy'; OperationGuid = 'a@contoso.com' }, [PSCustomObject]@{ error = 'proxy'; OperationGuid = 'b@contoso.com' }) }
+        { Invoke-CIPPBaselineMailboxDefaultAuditSet -Remediate $null -TenantFilter $script:Tenant -Current $Current } | Should -Throw '*all 2 writes failed*a@contoso.com -> proxy*'
     }
 }

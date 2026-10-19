@@ -4,6 +4,22 @@ function Push-ExecScheduledCommand {
         Entrypoint
     #>
     param($Item)
+
+    function Write-CippResultLog {
+        param([string]$Prefix, $Value, [int]$MaxItems = 25, [int]$MaxChars = 4096)
+        $Items = @($Value)
+        $ToLog = $Value
+        $Suffix = ''
+        if ($Items.Count -gt $MaxItems) {
+            $ToLog = $Items[0..($MaxItems - 1)]
+            $Suffix = " ...[$($Items.Count) items total, first $MaxItems logged]"
+        }
+        try { $Json = $ToLog | ConvertTo-Json -Depth 10 -Compress } catch { $Json = "$ToLog" }
+        if (-not $Json) { $Json = '' }
+        if ($Json.Length -gt $MaxChars) { $Json = $Json.Substring(0, $MaxChars) + '...[truncated]' }
+        Write-Information "${Prefix}: $Json$Suffix"
+    }
+
     $item = $Item | ConvertTo-Json -Depth 100 | ConvertFrom-Json
     Write-Information "We are going to be running a scheduled task: $($Item.TaskInfo | ConvertTo-Json -Depth 10)"
 
@@ -13,7 +29,7 @@ function Push-ExecScheduledCommand {
     # Initialize AsyncLocal storage for thread-safe per-invocation context
     # Store task id in CIPPCore module-scoped AsyncLocal storage so Write-LogMessage can read it -
     # global vars are unreliable in Azure Functions
-    Set-CippScheduledTaskContext -TaskId $Item.TaskInfo.RowKey
+    Set-CippScheduledTaskContext -TaskId $Item.TaskInfo.RowKey -AlertReNotify ([string]$Item.TaskInfo.AlertReNotify -eq 'True')
 
     # Store action source + creating user identity (from stored headers) for outbound User-Agent attribution
     Set-CippUserAgentContext -Headers $Item.Parameters.Headers -Source 'scheduled-task' -TaskId $Item.TaskInfo.RowKey
@@ -114,17 +130,12 @@ function Push-ExecScheduledCommand {
             } catch {
                 $ExceptionData = Get-CippException -Exception $_
                 if (!$IsMultiTenantExecution) {
-                    if ($secondsToAdd -gt 0) {
-                        $unixtimeNow = [int64](([datetime]::UtcNow) - (Get-Date '1/1/1970')).TotalSeconds
-                        if ([int64]$task.ScheduledTime -lt ($unixtimeNow - $secondsToAdd)) {
-                            $task.ScheduledTime = $unixtimeNow
-                        }
-                    }
+                    $NextRun = Get-CIPPScheduledTaskNextRun -Recurrence $task.Recurrence -ScheduledTime $task.ScheduledTime
                     $null = Update-AzDataTableEntity -Force @Table -Entity @{
                         PartitionKey  = $task.PartitionKey
                         RowKey        = $task.RowKey
                         Results       = "$($ExceptionData.NormalizedError)"
-                        ScheduledTime = [string]([int64]$task.ScheduledTime + [int64]$secondsToAdd)
+                        ScheduledTime = $NextRun -gt 0 ? [string]$NextRun : [string]$task.ScheduledTime
                         TaskState     = $secondsToAdd -gt 0 ? 'Failed - Planned' : 'Failed'
                     }
                 }
@@ -136,7 +147,7 @@ function Push-ExecScheduledCommand {
             if (-not $DeltaResults.ConditionsMet) {
                 Write-Information "Delta query conditions not met for tenant $Tenant. Skipping execution."
                 # update interval
-                $nextRunUnixTime = [int64]$task.ScheduledTime + [int64]$secondsToAdd
+                $nextRunUnixTime = Get-CIPPScheduledTaskNextRun -Recurrence $task.Recurrence -ScheduledTime $task.ScheduledTime
                 $null = Update-AzDataTableEntity -Force @Table -Entity @{
                     PartitionKey  = $task.PartitionKey
                     RowKey        = $task.RowKey
@@ -179,7 +190,7 @@ function Push-ExecScheduledCommand {
         return
     }
 
-    if ($Command.Module -notin @('CIPPCore', 'CIPPAlerts', 'CIPPStandards', 'CIPPTests', 'CIPPDB', 'CippExtensions', 'CIPPActivityTriggers')) {
+    if ($Command.Module -notin @('CIPPCore', 'CIPPAlerts', 'CIPPStandards', 'CIPPBaselines', 'CIPPTests', 'CIPPDB', 'CippExtensions', 'CIPPActivityTriggers')) {
         $State = 'Failed'
         Write-LogMessage -headers $Headers -API 'ScheduledTask' -message "Blocked attempt to schedule command from unauthorized module: $($Command.ModuleName)\$($Item.Command)" -Sev 'Warning'
         $Results = "Task blocked: The command '$($Item.Command)' is not permitted to run as a scheduled task."
@@ -225,6 +236,24 @@ function Push-ExecScheduledCommand {
         }
     } catch {
         Write-Information "Failed to remove parameters: $($_.Exception.Message)"
+    }
+
+    # Stored parameters are user input: the command's tenant parameter is forced to the authorized
+    # task tenant so a stored value can never target another tenant. When a command declares more
+    # than one tenant-identifying name, only the most specific one is injected and the others are
+    # dropped so the command resolves them itself.
+    $DeclaredTenantParams = [array](@('TenantFilter', 'Tenant', 'TenantId') | Where-Object { $Function.Parameters.ContainsKey($_) })
+    foreach ($TenantParamName in $DeclaredTenantParams) {
+        $StoredTenantValue = $commandParameters[$TenantParamName]
+        $StoredTenantString = [string]($StoredTenantValue.value ?? $StoredTenantValue)
+        if (![string]::IsNullOrWhiteSpace($StoredTenantString) -and $StoredTenantString -ne [string]$Tenant) {
+            Write-LogMessage -API 'Scheduler_UserTasks' -tenant $Tenant -tenantid $TenantInfo.customerId -message "Task $($task.Name): stored parameter -$TenantParamName value '$StoredTenantString' does not match the authorized tenant '$Tenant' and was overridden." -sev Error
+        }
+        if ($TenantParamName -eq $DeclaredTenantParams[0]) {
+            $commandParameters[$TenantParamName] = $Tenant
+        } else {
+            $commandParameters.Remove($TenantParamName)
+        }
     }
 
     if ($IsTriggerTask -eq $true -and $Trigger.ExecutePerResource -ne $true) {
@@ -275,7 +304,7 @@ function Push-ExecScheduledCommand {
             try {
                 Write-Information "Executing command $($Item.Command) for individual matched data item with parameters: $($individualCommandParameters | ConvertTo-Json -Depth 10)"
                 & $Item.Command @individualCommandParameters
-                Write-Information "Results for individual execution: $($results | ConvertTo-Json -Depth 10)"
+                Write-CippResultLog -Prefix 'Results for individual execution' -Value $results
             } catch {
                 Write-Information "Failed to execute command for individual matched data item: $($_.Exception.Message)"
             }
@@ -310,7 +339,7 @@ function Push-ExecScheduledCommand {
             $results = $results.Results
         }
 
-        Write-Information "Results: $($results | ConvertTo-Json -Depth 10)"
+        Write-CippResultLog -Prefix 'Results' -Value $results
         if ($item.command -like 'Get-CIPPAlert*') {
             Write-Information 'This is an alert task. Processing results as alerts.'
             $results = @($results)
@@ -332,7 +361,7 @@ function Push-ExecScheduledCommand {
                     @{ Results = $Message }
                 }
             }
-            Write-Information "Results after processing: $($results | ConvertTo-Json -Depth 10)"
+            Write-CippResultLog -Prefix 'Results after processing' -Value $results
             Write-Information 'Moving onto storing results'
             if ($results -is [string]) {
                 $StoredResults = $results
@@ -341,7 +370,7 @@ function Push-ExecScheduledCommand {
                 $StoredResults = $results | ConvertTo-Json -Compress -Depth 20 | Out-String
             }
         }
-        Write-Information "Results: $($results | ConvertTo-Json -Depth 10)"
+        Write-CippResultLog -Prefix 'Results' -Value $results
         if ($StoredResults.Length -gt 64000 -or $IsMultiTenantTask) {
             $TaskResultsTable = Get-CippTable -tablename 'ScheduledTaskResults'
             $TaskResults = @{
@@ -359,25 +388,8 @@ function Push-ExecScheduledCommand {
         # never less informative than the raw exception message it replaced.
         $ExceptionData = Get-CippException -Exception $_
         $errorMessage = $ExceptionData.NormalizedError
-        #if recurrence is just a number, add it in days.
-        if ($task.Recurrence -match '^\d+$') {
-            $task.Recurrence = $task.Recurrence + 'd'
-        }
-        $secondsToAdd = switch -Regex ($task.Recurrence) {
-            '(\d+)m$' { [int64]$matches[1] * 60 }
-            '(\d+)h$' { [int64]$matches[1] * 3600 }
-            '(\d+)d$' { [int64]$matches[1] * 86400 }
-            default { 0 }
-        }
-
-        if ($secondsToAdd -gt 0) {
-            $unixtimeNow = [int64](([datetime]::UtcNow) - (Get-Date '1/1/1970')).TotalSeconds
-            if ([int64]$task.ScheduledTime -lt ($unixtimeNow - $secondsToAdd)) {
-                $task.ScheduledTime = $unixtimeNow
-            }
-        }
-
-        $nextRunUnixTime = [int64]$task.ScheduledTime + [int64]$secondsToAdd
+        $nextRunUnixTime = Get-CIPPScheduledTaskNextRun -Recurrence $task.Recurrence -ScheduledTime $task.ScheduledTime
+        if ($nextRunUnixTime -eq 0) { $nextRunUnixTime = $task.ScheduledTime }
         if ($task.Recurrence -ne 0) { $State = 'Failed - Planned' } else { $State = 'Failed' }
         Write-Information "The job is recurring, but failed. It was scheduled for $($task.ScheduledTime). The next runtime should be $nextRunUnixTime"
         if (!$IsMultiTenantExecution) {
@@ -404,7 +416,18 @@ function Push-ExecScheduledCommand {
         if ($TaskAttachments) {
             $AlertParams.Attachments = $TaskAttachments
         }
-        Send-CIPPScheduledTaskAlert @AlertParams
+        $PostExecutionResults = @(Send-CIPPScheduledTaskAlert @AlertParams)
+        # Keep the delivery outcomes with the task, so a failed webhook, email or PSA note shows on the task page.
+        try {
+            $TaskTable = Get-CippTable -tablename 'ScheduledTasks'
+            $null = Update-AzDataTableEntity -Force @TaskTable -Entity @{
+                PartitionKey         = $task.PartitionKey
+                RowKey               = $task.RowKey
+                PostExecutionResults = [string](ConvertTo-Json -Compress -Depth 5 -InputObject $PostExecutionResults)
+            }
+        } catch {
+            Write-Information "Could not store the post-execution results: $($_.Exception.Message)"
+        }
     }
 
     try {
@@ -443,25 +466,8 @@ function Push-ExecScheduledCommand {
                 TaskState    = 'Completed'
             }
         } else {
-            #if recurrence is just a number, add it in days.
-            if ($task.Recurrence -match '^\d+$') {
-                $task.Recurrence = $task.Recurrence + 'd'
-            }
-            $secondsToAdd = switch -Regex ($task.Recurrence) {
-                '(\d+)m$' { [int64]$matches[1] * 60 }
-                '(\d+)h$' { [int64]$matches[1] * 3600 }
-                '(\d+)d$' { [int64]$matches[1] * 86400 }
-                default { 0 }
-            }
-
-            if ($secondsToAdd -gt 0) {
-                $unixtimeNow = [int64](([datetime]::UtcNow) - (Get-Date '1/1/1970')).TotalSeconds
-                if ([int64]$task.ScheduledTime -lt ($unixtimeNow - $secondsToAdd)) {
-                    $task.ScheduledTime = $unixtimeNow
-                }
-            }
-
-            $nextRunUnixTime = [int64]$task.ScheduledTime + [int64]$secondsToAdd
+            $nextRunUnixTime = Get-CIPPScheduledTaskNextRun -Recurrence $task.Recurrence -ScheduledTime $task.ScheduledTime
+            if ($nextRunUnixTime -eq 0) { $nextRunUnixTime = $task.ScheduledTime }
             Write-Information "The job is recurring. It was scheduled for $($task.ScheduledTime). The next runtime should be $nextRunUnixTime"
             Update-AzDataTableEntity -Force @Table -Entity @{
                 PartitionKey  = $task.PartitionKey

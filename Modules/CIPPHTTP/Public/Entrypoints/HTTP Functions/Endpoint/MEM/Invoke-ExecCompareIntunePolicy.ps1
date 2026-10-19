@@ -28,24 +28,34 @@ function Invoke-ExecCompareIntunePolicy {
         'ManagedAppPolicies'           = 'AppProtection'
     }
 
-    try {
-        $Body = $Request.Body
-        $SourceA = $Body.sourceA
-        $SourceB = $Body.sourceB
+    $Body = $Request.Body
+    $SourceA = $Body.sourceA
+    $SourceB = $Body.sourceB
 
-        if (-not $SourceA -or -not $SourceB) {
-            throw 'Both sourceA and sourceB are required'
-        }
+    if (-not $SourceA -or -not $SourceB) {
+        return ([HttpResponseContext]@{
+                StatusCode = [HttpStatusCode]::BadRequest
+                Body       = ConvertTo-Json -InputObject @{ Results = 'Failed to compare policies: Both sourceA and sourceB are required' }
+            })
+    }
 
-        # AnyTenant: source tenants must be in the caller's scope; Get-Tenants is narrowed
-        $AllowedTenants = Test-CIPPAccess -Request $Request -TenantList
-        if ($AllowedTenants -notcontains 'AllTenants') {
-            foreach ($SourceTenant in @($SourceA.tenantFilter, $SourceB.tenantFilter)) {
-                if ($SourceTenant -and -not (Get-Tenants -TenantFilter $SourceTenant)) {
-                    throw 'Access to this tenant is not allowed'
-                }
+    # AnyTenant: source tenants must be in the caller's scope; Get-Tenants is narrowed
+    $AllowedTenants = Test-CIPPAccess -Request $Request -TenantList
+    if ($AllowedTenants -notcontains 'AllTenants') {
+        foreach ($SourceTenant in @($SourceA.tenantFilter, $SourceB.tenantFilter)) {
+            if ($SourceTenant -and -not (Get-Tenants -TenantFilter $SourceTenant)) {
+                return ([HttpResponseContext]@{
+                        StatusCode = [HttpStatusCode]::Forbidden
+                        Body       = ConvertTo-Json -InputObject @{ Results = 'Failed to compare policies: Access to this tenant is not allowed' }
+                    })
             }
         }
+    }
+
+    # Set by a resolver right before it throws for bad input or a missing source; anything else is 500.
+    $FailureStatus = @{ Code = [HttpStatusCode]::InternalServerError }
+
+    try {
 
         # Load a stored Intune template. When a tenant is supplied the template is put through the
         # same preparation the IntuneTemplate standard uses - nesting repair, reusable settings sync
@@ -56,6 +66,9 @@ function Invoke-ExecCompareIntunePolicy {
                 [string]$TemplateGuid,
                 [string]$TenantFilter,
                 [string]$Label,
+                # The standards template the caller is looking at, used only to name a template
+                # that no longer exists by the label the standard still carries for it.
+                [string]$StandardsTemplateId,
                 # Set when the caller only needs the template's identity and type in order to find
                 # the tenant's own copy. Skips the reusable settings sync, which writes to the
                 # tenant and is the other source's job to run.
@@ -63,10 +76,19 @@ function Invoke-ExecCompareIntunePolicy {
             )
 
             $Table = Get-CippTable -tablename 'templates'
-            $TemplateEntity = Get-CIPPAzDataTableEntity @Table -Filter "PartitionKey eq 'IntuneTemplate' and RowKey eq '$TemplateGuid'"
+            # The picker surfaces the GUID column while the engine keys on RowKey. CIPP writes both
+            # to the same value, but a template re-synced by an older release can carry a JSON GUID
+            # that differs from its RowKey - accept either rather than calling a present template missing.
+            $SafeGuid = ConvertTo-CIPPODataFilterValue -Value $TemplateGuid -Type String
+            $TemplateEntity = Get-CIPPAzDataTableEntity @Table -Filter "PartitionKey eq 'IntuneTemplate' and (RowKey eq '$SafeGuid' or GUID eq '$SafeGuid')" | Select-Object -First 1
 
             if (-not $TemplateEntity) {
-                throw "$Label : Template with GUID '$TemplateGuid' not found"
+                # A bare id sends people searching the template table for a row that is gone. Name
+                # it by the label the standards template still holds, and say where to fix it.
+                $StandardEntry = Get-StandardEntry -StandardsTemplateId $StandardsTemplateId -TemplateGuid $TemplateGuid
+                $KnownAs = if ($StandardEntry.TemplateList.label) { "'$($StandardEntry.TemplateList.label)' " } else { '' }
+                $FailureStatus.Code = [HttpStatusCode]::NotFound
+                throw "$Label : Intune template $KnownAs($TemplateGuid) no longer exists in the template library. Remove it from the standards or drift template, or select the template again."
             }
 
             $JSONData = $TemplateEntity.JSON | ConvertFrom-Json -Depth 100
@@ -103,6 +125,15 @@ function Invoke-ExecCompareIntunePolicy {
                         Write-Warning "$Label : Could not resolve available settings, comparing against the full template - $($_.Exception.Message)"
                     }
                 }
+                if ($TemplateType -eq 'Admin') {
+                    # Imported ADMX settings bind to per-tenant definition ids; compare against the
+                    # binds deployment would write to this tenant.
+                    try {
+                        $Object = Resolve-CIPPIntuneAdminTemplateBinding -RawJSON (ConvertTo-Json -InputObject $Object -Depth 100 -Compress) -TenantFilter $TenantFilter -DisplayName $JSONData.Displayname | ConvertFrom-Json -Depth 100
+                    } catch {
+                        Write-Warning "$Label : Could not resolve the administrative template settings in this tenant, comparing against the stored template - $($_.Exception.Message)"
+                    }
+                }
             }
 
             return @{
@@ -122,28 +153,39 @@ function Invoke-ExecCompareIntunePolicy {
         # A standard can be configured to replace a similarly named policy on deployment rather than
         # create a new one. That setting lives on the standards template, keyed by the Intune
         # template GUID, and is stored as a string by the settings form.
+        # The IntuneTemplate entry of a standards template for one Intune template GUID - the
+        # settings (fuzzy distance, assignment target, verifyAssignments) the standard runs with.
+        function Get-StandardEntry {
+            param(
+                [string]$StandardsTemplateId,
+                [string]$TemplateGuid
+            )
+
+            if (-not $StandardsTemplateId -or -not $TemplateGuid) { return $null }
+
+            try {
+                $Table = Get-CippTable -tablename 'templates'
+                $SafeId = ConvertTo-CIPPODataFilterValue -Value $StandardsTemplateId -Type String
+                $Entity = Get-CIPPAzDataTableEntity @Table -Filter "PartitionKey eq 'StandardsTemplateV2' and RowKey eq '$SafeId'"
+                if (-not $Entity) { return $null }
+
+                $Standards = ($Entity.JSON | ConvertFrom-Json -Depth 100).standards.IntuneTemplate
+                return @($Standards) | Where-Object { $_.TemplateList.value -eq $TemplateGuid } | Select-Object -First 1
+            } catch {
+                Write-Warning "Could not read standards template '$StandardsTemplateId': $($_.Exception.Message)"
+                return $null
+            }
+        }
+
         function Get-StandardFuzzyDistance {
             param(
                 [string]$StandardsTemplateId,
                 [string]$TemplateGuid
             )
 
-            if (-not $StandardsTemplateId) { return 0 }
-
-            try {
-                $Table = Get-CippTable -tablename 'templates'
-                $Entity = Get-CIPPAzDataTableEntity @Table -Filter "PartitionKey eq 'StandardsTemplateV2' and RowKey eq '$StandardsTemplateId'"
-                if (-not $Entity) { return 0 }
-
-                $Standards = ($Entity.JSON | ConvertFrom-Json -Depth 100).standards.IntuneTemplate
-                $Match = @($Standards) | Where-Object { $_.TemplateList.value -eq $TemplateGuid } | Select-Object -First 1
-
-                if ([string]::IsNullOrWhiteSpace($Match.levenshteinDistance)) { return 0 }
-                return [int]$Match.levenshteinDistance
-            } catch {
-                Write-Warning "Could not read the fuzzy match distance from standards template '$StandardsTemplateId': $($_.Exception.Message)"
-                return 0
-            }
+            $Match = Get-StandardEntry -StandardsTemplateId $StandardsTemplateId -TemplateGuid $TemplateGuid
+            if ([string]::IsNullOrWhiteSpace($Match.levenshteinDistance)) { return 0 }
+            return [int]$Match.levenshteinDistance
         }
 
         # Resolve a source descriptor to its policy object and metadata
@@ -156,12 +198,13 @@ function Invoke-ExecCompareIntunePolicy {
 
             if ($Source.type -eq 'template') {
                 if (-not $Source.templateGuid) {
+                    $FailureStatus.Code = [HttpStatusCode]::BadRequest
                     throw "$Label : templateGuid is required for template sources"
                 }
 
                 # tenantFilter is optional here - supplying it resolves the template the way the
                 # standard would for that tenant instead of comparing the stored template verbatim.
-                $Template = Get-ComparisonTemplate -TemplateGuid $Source.templateGuid -TenantFilter $Source.tenantFilter -Label $Label
+                $Template = Get-ComparisonTemplate -TemplateGuid $Source.templateGuid -TenantFilter $Source.tenantFilter -Label $Label -StandardsTemplateId $Source.standardsTemplateId
                 $LabelSuffix = if ($Source.tenantFilter) { "Template, resolved for $($Source.tenantFilter)" } else { 'Template' }
 
                 return @{
@@ -176,13 +219,14 @@ function Invoke-ExecCompareIntunePolicy {
                 # but not which policy in the tenant it landed on. Matches the standard's own lookup:
                 # by the template's display name and type.
                 if (-not $Source.templateGuid -or -not $Source.tenantFilter) {
+                    $FailureStatus.Code = [HttpStatusCode]::BadRequest
                     throw "$Label : templateGuid and tenantFilter are required for tenantPolicyByTemplate sources"
                 }
 
                 # Resolved for the tenant, because the name a policy is deployed under can depend on
                 # tenant variables in the payload. The reusable settings sync is skipped - it writes
                 # to the tenant, and the baseline source already runs it.
-                $Template = Get-ComparisonTemplate -TemplateGuid $Source.templateGuid -TenantFilter $Source.tenantFilter -SkipReusableSync -Label $Label
+                $Template = Get-ComparisonTemplate -TemplateGuid $Source.templateGuid -TenantFilter $Source.tenantFilter -SkipReusableSync -Label $Label -StandardsTemplateId $Source.standardsTemplateId
 
                 if (-not $Template.TemplateType) {
                     throw "$Label : Template '$($Template.DisplayName)' has no policy type and none could be inferred. Re-import the template to fix this."
@@ -243,28 +287,55 @@ function Invoke-ExecCompareIntunePolicy {
 
                 $PolicyObj = $Policy.cippconfiguration | ConvertFrom-Json -Depth 100
 
+                # The settings diff ignores assignments. When the standard verifies them, run the
+                # same comparison the standard runs, so this dialog cannot say "matches" while the
+                # drift report for the same policy says the assignments differ.
+                $AssignmentComparison = $null
+                $StandardEntry = Get-StandardEntry -StandardsTemplateId $Source.standardsTemplateId -TemplateGuid $Source.templateGuid
+                if ($StandardEntry.verifyAssignments -eq $true) {
+                    try {
+                        $ExistingAssignments = Get-CIPPIntunePolicyAssignments -PolicyId $Policy.id -TemplateType $Template.TemplateType -TenantFilter $Source.tenantFilter -ExistingPolicy $Policy
+                        $AssignmentDetail = Compare-CIPPIntuneAssignments -ExistingAssignments $ExistingAssignments -ExpectedAssignTo $StandardEntry.AssignTo -ExpectedCustomGroup $StandardEntry.customGroup -ExpectedExcludeGroup $StandardEntry.excludeGroup -ExpectedAssignmentFilter $StandardEntry.assignmentFilter -ExpectedAssignmentFilterType ($StandardEntry.assignmentFilterType ?? 'include') -PolicyType $Template.TemplateType -TenantFilter $Source.tenantFilter
+                        $AssignmentComparison = @{
+                            matched = if ($AssignmentDetail.Unknown) { $null } else { [bool]$AssignmentDetail.Matched }
+                            unknown = [bool]$AssignmentDetail.Unknown
+                            reasons = @($AssignmentDetail.Reasons)
+                        }
+                    } catch {
+                        $AssignmentComparison = @{
+                            matched = $null
+                            unknown = $true
+                            reasons = @("Assignments could not be read: $($_.Exception.Message)")
+                        }
+                    }
+                }
+
                 return @{
-                    Object       = $PolicyObj
-                    TemplateType = $Template.TemplateType
-                    Label        = "$MatchedName ($($Source.tenantFilter))"
-                    RawData      = $PolicyObj
-                    MatchType    = $MatchType
-                    MatchedName  = $MatchedName
+                    Object               = $PolicyObj
+                    TemplateType         = $Template.TemplateType
+                    Label                = "$MatchedName ($($Source.tenantFilter))"
+                    RawData              = $PolicyObj
+                    MatchType            = $MatchType
+                    MatchedName          = $MatchedName
+                    AssignmentComparison = $AssignmentComparison
                 }
 
             } elseif ($Source.type -eq 'tenantPolicy') {
                 if (-not $Source.tenantFilter -or -not $Source.policyId -or -not $Source.urlName) {
+                    $FailureStatus.Code = [HttpStatusCode]::BadRequest
                     throw "$Label : tenantFilter, policyId, and urlName are required for tenant policy sources"
                 }
 
                 $TemplateType = $URLNameToTemplateType[$Source.urlName]
                 if (-not $TemplateType) {
+                    $FailureStatus.Code = [HttpStatusCode]::BadRequest
                     throw "$Label : Unknown policy type '$($Source.urlName)'"
                 }
 
                 $Policy = Get-CIPPIntunePolicy -TemplateType $TemplateType -PolicyID $Source.policyId -tenantFilter $Source.tenantFilter -Headers $Headers -APINAME $APIName
 
                 if (-not $Policy) {
+                    $FailureStatus.Code = [HttpStatusCode]::NotFound
                     throw "$Label : Policy '$($Source.policyId)' not found in tenant '$($Source.tenantFilter)'"
                 }
 
@@ -280,11 +351,13 @@ function Invoke-ExecCompareIntunePolicy {
 
             } elseif ($Source.type -eq 'communityRepo') {
                 if (-not $Source.fullName -or -not $Source.branch -or -not $Source.path) {
+                    $FailureStatus.Code = [HttpStatusCode]::BadRequest
                     throw "$Label : fullName, branch, and path are required for community repo sources"
                 }
 
                 $FileContent = Get-GitHubFileContents -FullName $Source.fullName -Path $Source.path -Branch $Source.branch
                 if (-not $FileContent -or -not $FileContent.content) {
+                    $FailureStatus.Code = [HttpStatusCode]::NotFound
                     throw "$Label : Could not retrieve file '$($Source.path)' from '$($Source.fullName)' branch '$($Source.branch)'"
                 }
 
@@ -329,6 +402,7 @@ function Invoke-ExecCompareIntunePolicy {
                 }
 
             } else {
+                $FailureStatus.Code = [HttpStatusCode]::BadRequest
                 throw "$Label : Invalid source type '$($Source.type)'. Must be 'template', 'tenantPolicy', 'tenantPolicyByTemplate', or 'communityRepo'"
             }
         }
@@ -389,6 +463,9 @@ function Invoke-ExecCompareIntunePolicy {
             # the result should be read - the caller says so rather than implying a name match.
             matchType    = $ResolvedB.MatchType ?? $ResolvedA.MatchType
             matchedName  = $ResolvedB.MatchedName ?? $ResolvedA.MatchedName
+            # Present only when the standard verifies assignments; null otherwise so the dialog
+            # says nothing about a dimension that was not compared.
+            assignmentComparison = $ResolvedB.AssignmentComparison ?? $ResolvedA.AssignmentComparison
         }
 
         Write-LogMessage -headers $Headers -API $APIName -message "Compared Intune policies: $($ResolvedA.Label) vs $($ResolvedB.Label) - $($ComparisonResults.Count) differences found" -Sev 'Info'
@@ -402,7 +479,7 @@ function Invoke-ExecCompareIntunePolicy {
         $ErrorMessage = Get-CippException -Exception $_
         Write-LogMessage -headers $Headers -API $APIName -message "Failed to compare Intune policies: $($ErrorMessage.NormalizedError)" -Sev 'Error' -LogData $ErrorMessage
         return ([HttpResponseContext]@{
-                StatusCode = [HttpStatusCode]::BadRequest
+                StatusCode = $FailureStatus.Code
                 Body       = ConvertTo-Json -Depth 100 -InputObject @{
                     Results = "Failed to compare policies: $($ErrorMessage.NormalizedError)"
                 }

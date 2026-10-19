@@ -117,11 +117,11 @@ function Get-CippMcpToolResult {
                 $Near = @((Find-CippMcpTool -Request $Request -Query $TargetName -Limit 5).tools | ForEach-Object { $_.name })
                 $Hint = if ($Near.Count -gt 0) { " Did you mean: $($Near -join ', ')?" } else { ' Use SearchTools to discover valid tool names.' }
                 return [ordered]@{
-                    content = @(@{ type = 'text'; text = "No read-only tool named '$TargetName'.$Hint" })
+                    content = @(@{ type = 'text'; text = "No tool named '$TargetName' is available to you.$Hint" })
                     isError = $true
                 }
             }
-            return Invoke-CippMcpApiRequest -Request $Request -TriggerMetadata $TriggerMetadata -ToolName $TargetName -Arguments $ArgHash['arguments'] -Method $Entry._method -ParamAlias $Entry._paramAlias
+            return Invoke-CippMcpApiRequest -Request $Request -TriggerMetadata $TriggerMetadata -ToolName $TargetName -Arguments $ArgHash['arguments'] -Method $Entry._method -ParamAlias $Entry._paramAlias -InputSchema $Entry.inputSchema
         }
         default {
             # Core passthroughs (always available) and legacy direct catalog calls (respect connector scoping).
@@ -135,7 +135,7 @@ function Get-CippMcpToolResult {
             if (-not $Entry) {
                 throw [pscustomobject]@{ code = -32602; message = "Unknown or unavailable tool: $ToolName. Use SearchTools to discover valid tool names." }
             }
-            return Invoke-CippMcpApiRequest -Request $Request -TriggerMetadata $TriggerMetadata -ToolName $ToolName -Arguments $Arguments -Method $Entry._method -ParamAlias $Entry._paramAlias
+            return Invoke-CippMcpApiRequest -Request $Request -TriggerMetadata $TriggerMetadata -ToolName $ToolName -Arguments $Arguments -Method $Entry._method -ParamAlias $Entry._paramAlias -InputSchema $Entry.inputSchema
         }
     }
 }

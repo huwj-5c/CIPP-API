@@ -9,11 +9,17 @@ function Invoke-ExecCreateSAMApp {
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
 
+    $APIName = $Request.Params.CIPPEndpoint
+    $Headers = $Request.Headers
     $KV = Get-CippKeyVaultName
+    $StatusCode = [HttpStatusCode]::OK
 
     try {
         $Token = $Request.body
         if ($Token) {
+            # A certificate-only setup provisions no client secret. Determined up front so every app
+            # management policy call in this flow leaves the password-addition block in force.
+            $CertificateOnly = $Request.body.certificateOnly -eq $true
             $URL = $Request.headers.origin ?? $Request.headers.referer?.TrimEnd('/')
             $RedirectUri = "$URL/authredirect"
             $AuthCallbackUri = "$URL/.auth/callback"
@@ -71,14 +77,43 @@ function Invoke-ExecCreateSAMApp {
 
             try {
 
-                $AppPolicyStatus = Update-AppManagementPolicy -Headers @{ authorization = "Bearer $($Token.access_token)" } -ApplicationId $appId.appId
+                $AppPolicyStatus = Update-AppManagementPolicy -Headers @{ authorization = "Bearer $($Token.access_token)" } -ApplicationId $appId.appId -CertificateOnly $CertificateOnly
                 Write-Information $AppPolicyStatus.PolicyAction
             } catch {
                 Write-Warning "Error updating app management policy $($_.Exception.Message)."
                 Write-Information ($_.InvocationInfo.PositionMessage)
             }
 
-            $AppPassword = (Invoke-RestMethod "https://graph.microsoft.com/v1.0/applications/$($AppId.id)/addPassword" -Headers @{ authorization = "Bearer $($Token.access_token)" } -Method POST -Body '{"passwordCredential":{"displayName":"CIPPInstall"}}' -ContentType 'application/json').secretText
+            # A certificate-only setup provisions no client secret - the SAM certificate is the sole
+            # credential. Register it now (before the token step, which will authenticate with it) and
+            # turn on the feature flag so the reload below resolves certificate mode.
+            if ($CertificateOnly) {
+                try {
+                    # Enable certificate mode BEFORE provisioning so the app management policy exemption
+                    # leaves the password-addition block in force (no client secret is ever added).
+                    $null = Set-CIPPFeatureFlag -Id 'CertificateAuthentication' -Enabled $true -Force
+                    $env:CertificateAuthMode = $true
+                    $CertResult = Update-CIPPSAMCertificate -ApplicationId $AppId.appId -Headers @{ authorization = "Bearer $($Token.access_token)" } -ErrorAction Stop
+                    Write-Information "Registered SAM certificate for certificate-only setup. Thumbprint: $($CertResult.Thumbprint), storage mode: $($CertResult.StorageMode)"
+                } catch {
+                    $null = Set-CIPPFeatureFlag -Id 'CertificateAuthentication' -Enabled $false -Force
+                    $env:CertificateAuthMode = $null
+                    throw "Certificate-only setup was selected but the SAM certificate could not be registered on the application. Setup cannot continue without a credential. $($_.Exception.Message)"
+                }
+                # The certificate is the only credential, so it must prove it can obtain a token.
+                $Probe = Test-CIPPSAMCertificateAuth -ApplicationId $AppId.appId -TenantId $TenantId
+                if (-not $Probe.Success) {
+                    $null = Set-CIPPFeatureFlag -Id 'CertificateAuthentication' -Enabled $false -Force
+                    $env:CertificateAuthMode = $null
+                    throw "Certificate-only setup failed: the SAM certificate $($Probe.Thumbprint) could not obtain a token ($($Probe.Error))."
+                }
+                $AppPassword = $null
+                $AppPasswordKeyId = ''
+            } else {
+                $NewPassword = Invoke-RestMethod "https://graph.microsoft.com/v1.0/applications/$($AppId.id)/addPassword" -Headers @{ authorization = "Bearer $($Token.access_token)" } -Method POST -Body '{"passwordCredential":{"displayName":"CIPPInstall"}}' -ContentType 'application/json'
+                $AppPassword = $NewPassword.secretText
+                $AppPasswordKeyId = [string]$NewPassword.keyId
+            }
 
             if ($env:AzureWebJobsStorage -eq 'UseDevelopmentStorage=true' -or $env:NonLocalHostAzurite -eq 'true') {
                 $DevSecretsTable = Get-CIPPTable -tablename 'DevSecrets'
@@ -88,12 +123,17 @@ function Invoke-ExecCreateSAMApp {
                 $Secret | Add-Member -MemberType NoteProperty -Name 'RowKey' -Value 'Secret' -Force
                 $Secret | Add-Member -MemberType NoteProperty -Name 'tenantid' -Value $TenantId -Force
                 $Secret | Add-Member -MemberType NoteProperty -Name 'applicationid' -Value $AppId.appId -Force
-                $Secret | Add-Member -MemberType NoteProperty -Name 'applicationsecret' -Value $AppPassword -Force
+                # Blank the stored secret in certificate-only mode so CIPP falls through to the certificate
+                $Secret | Add-Member -MemberType NoteProperty -Name 'applicationsecret' -Value ($AppPassword ?? '') -Force
                 Add-CIPPAzDataTableEntity @DevSecretsTable -Entity $Secret -Force
             } else {
                 Set-CippKeyVaultSecret -VaultName $kv -Name 'tenantid' -SecretValue (ConvertTo-SecureString -String $TenantId -AsPlainText -Force)
                 Set-CippKeyVaultSecret -VaultName $kv -Name 'applicationid' -SecretValue (ConvertTo-SecureString -String $Appid.appId -AsPlainText -Force)
-                Set-CippKeyVaultSecret -VaultName $kv -Name 'applicationsecret' -SecretValue (ConvertTo-SecureString -String $AppPassword -AsPlainText -Force)
+                # Certificate-only setups create no secret; leave the placeholder in place so it reads
+                # back as unusable and CIPP authenticates with the certificate instead.
+                if ($AppPassword) {
+                    Set-CippKeyVaultSecret -VaultName $kv -Name 'applicationsecret' -SecretValue (ConvertTo-SecureString -String $AppPassword -AsPlainText -Force)
+                }
             }
             # Populate this process straight from the values we just created. The wizard
             # moves to the next step immediately and every reader treats $env:ApplicationID
@@ -134,7 +174,7 @@ function Invoke-ExecCreateSAMApp {
                 }
             }
             if (-not $SecretsReadable) {
-                Write-LogMessage -message "Created the application registration but could not read the application id back from storage after $ReadAttempts attempts. This instance holds the new credentials, but other instances may still serve the previous values until the write propagates." -Sev 'Warning'
+                Write-LogMessage -headers $Headers -API $APIName -tenant 'Global' -message "Created the application registration but could not read the application id back from storage after $ReadAttempts attempts. This instance holds the new credentials, but other instances may still serve the previous values until the write propagates." -Sev 'Warning'
             }
 
             $ConfigTable = Get-CippTable -tablename 'Config'
@@ -143,6 +183,7 @@ function Invoke-ExecCreateSAMApp {
                 PartitionKey  = 'AppCache'
                 RowKey        = 'AppCache'
                 ApplicationId = $AppId.appId
+                SecretKeyId   = $AppPasswordKeyId
             }
             Add-CIPPAzDataTableEntity @ConfigTable -Entity $NewConfig -Force | Out-Null
 
@@ -172,7 +213,16 @@ function Invoke-ExecCreateSAMApp {
                 Write-Warning "Failed to create SAM certificate during setup, the weekly token update will create it: $($_.Exception.Message)"
             }
 
-            $Results = @{'message' = "Successfully $state the application registration. The application ID is $($AppId.appid). You may continue to the next step."; severity = 'success' }
+            $CredentialNote = if ($CertificateOnly) { ' This is a certificate-only setup - no client secret was created, and CIPP will authenticate with the SAM certificate.' } else { '' }
+            $Results = @{'message' = "Successfully $state the application registration. The application ID is $($AppId.appid).$CredentialNote You may continue to the next step."; severity = 'success' }
+            $Actor = 'CIPP'
+            $SecretNote = ''
+            if ($AppPasswordKeyId) {
+                try { $Actor = Set-CIPPSAMCredentialRecord -KeyId $AppPasswordKeyId -Source 'Setup' -Headers $Headers } catch { Write-Information "Could not record the setup secret's provenance: $($_.Exception.Message)" }
+                $SecretNote = ", new client secret 'CIPPInstall' created (keyId $AppPasswordKeyId)"
+            }
+            Write-LogMessage -headers $Headers -API $APIName -tenant 'Global' -message "Setup by $Actor`: $state CIPP-SAM application registration AppId=$($AppId.appId) (certificate-only=$CertificateOnly)$SecretNote" -Sev 'Alert'
+            try { $null = Compare-CIPPSAMCredentialSnapshot -Acknowledge $AppPasswordKeyId } catch { Write-Information "Could not refresh the SAM credential snapshot: $($_.Exception.Message)" }
         }
 
     } catch {
@@ -184,11 +234,13 @@ function Invoke-ExecCreateSAMApp {
         } else {
             $_.Exception.Message
         }
+        Write-LogMessage -headers $Headers -API $APIName -tenant 'Global' -message "Failed to create or update CIPP-SAM application registration: $ErrorDetail" -Sev 'Error'
         $Results = [pscustomobject]@{'Results' = "Failed. $($_.InvocationInfo.ScriptLineNumber):  $ErrorDetail"; severity = 'failed' }
+        $StatusCode = [HttpStatusCode]::InternalServerError
     }
 
     return ([HttpResponseContext]@{
-            StatusCode = [HttpStatusCode]::OK
+            StatusCode = $StatusCode
             Body       = $Results
         })
 
